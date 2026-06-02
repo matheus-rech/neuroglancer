@@ -18,9 +18,12 @@ import { describe, it, expect } from "vitest";
 import { TrackableValue } from "#src/trackable_value.js";
 import { DataType } from "#src/util/data_type.js";
 import { vec3, vec4 } from "#src/util/geom.js";
-import { defaultDataTypeRange } from "#src/util/lerp.js";
+import {
+  computeLerp,
+  dataTypeIntervalEqual,
+  defaultDataTypeRange,
+} from "#src/util/lerp.js";
 
-import { Uint64 } from "#src/util/uint64.js";
 import { getShaderType } from "#src/webgl/shader_lib.js";
 import { fragmentShaderTest } from "#src/webgl/shader_testing.js";
 import type { TransferFunctionParameters } from "#src/widget/transfer_function.js";
@@ -54,6 +57,88 @@ function makeTransferFunction(controlPoints: ControlPoint[]) {
     ),
   );
 }
+
+describe("Create default transfer function", () => {
+  for (const dataType of Object.values(DataType)) {
+    if (typeof dataType === "string") continue;
+    const transferFunction = new TransferFunction(
+      dataType,
+      new TrackableValue<TransferFunctionParameters>(
+        {
+          sortedControlPoints: new SortedControlPoints([], dataType),
+          window: defaultDataTypeRange[dataType],
+          defaultColor: vec3.fromValues(1, 0.2, 1),
+          channel: [],
+        },
+        (x) => x,
+      ),
+    );
+    it(`Creates two default transfer function points for ${DataType[dataType]} over the default window`, () => {
+      transferFunction.generateDefaultControlPoints();
+      expect(transferFunction.sortedControlPoints.controlPoints.length).toBe(2);
+      const firstPoint = transferFunction.sortedControlPoints.controlPoints[0];
+      const lastPoint = transferFunction.sortedControlPoints.controlPoints[1];
+      const range = defaultDataTypeRange[dataType];
+      const actualFirstPoint = computeLerp(range, dataType, 0.3);
+      const actualLastPoint = computeLerp(range, dataType, 0.7);
+      expect(firstPoint.inputValue).toStrictEqual(actualFirstPoint);
+      expect(lastPoint.inputValue).toStrictEqual(actualLastPoint);
+      expect(firstPoint.outputColor).toEqual(vec4.fromValues(0, 0, 0, 0));
+      expect(lastPoint.outputColor).toEqual(vec4.fromValues(255, 51, 255, 255));
+    });
+    it(`Creates two default transfer function points for ${DataType[dataType]} over a custom window`, () => {
+      const window =
+        dataType === DataType.UINT64
+          ? ([0n, 100n] as [bigint, bigint])
+          : ([0, 100] as [number, number]);
+      transferFunction.generateDefaultControlPoints(null, window);
+      expect(transferFunction.sortedControlPoints.controlPoints.length).toBe(2);
+      const firstPoint = transferFunction.sortedControlPoints.controlPoints[0];
+      const lastPoint = transferFunction.sortedControlPoints.controlPoints[1];
+      const actualFirstPoint = computeLerp(window, dataType, 0.3);
+      const actualLastPoint = computeLerp(window, dataType, 0.7);
+      expect(firstPoint.inputValue).toStrictEqual(actualFirstPoint);
+      expect(lastPoint.inputValue).toStrictEqual(actualLastPoint);
+      expect(firstPoint.outputColor).toEqual(vec4.fromValues(0, 0, 0, 0));
+      expect(lastPoint.outputColor).toEqual(vec4.fromValues(255, 51, 255, 255));
+    });
+    it(`Creates two default transfer function points for ${DataType[dataType]} with a defined range`, () => {
+      const range =
+        dataType === DataType.UINT64
+          ? ([0n, 100n] as [bigint, bigint])
+          : ([0, 100] as [number, number]);
+      transferFunction.generateDefaultControlPoints(range);
+      expect(transferFunction.sortedControlPoints.controlPoints.length).toBe(2);
+      const firstPoint = transferFunction.sortedControlPoints.controlPoints[0];
+      const lastPoint = transferFunction.sortedControlPoints.controlPoints[1];
+      expect(firstPoint.inputValue).toStrictEqual(range[0]);
+      expect(lastPoint.inputValue).toStrictEqual(range[1]);
+      expect(firstPoint.outputColor).toEqual(vec4.fromValues(0, 0, 0, 0));
+      expect(lastPoint.outputColor).toEqual(vec4.fromValues(255, 51, 255, 255));
+    });
+    it(`Creates a window which bounds the control points for ${DataType[dataType]}`, () => {
+      const range =
+        dataType === DataType.UINT64
+          ? ([0n, 100n] as [bigint, bigint])
+          : ([0, 100] as [number, number]);
+      const pointInputValues = [0, 20, 40, 60, 80, 100];
+      transferFunction.sortedControlPoints.clear();
+      for (const inputValue of pointInputValues) {
+        const valueToAdd =
+          dataType === DataType.UINT64 ? BigInt(inputValue) : inputValue;
+        transferFunction.addPoint(
+          new ControlPoint(valueToAdd, vec4.fromValues(0, 0, 0, 0)),
+        );
+      }
+      transferFunction.generateDefaultWindow();
+      const window = transferFunction.trackable.value.window;
+      expect(
+        dataTypeIntervalEqual(window, range),
+        `Got ${window} expected ${range}`,
+      ).toBeTruthy();
+    });
+  }
+});
 
 describe("lerpBetweenControlPoints", () => {
   const output = new Uint8Array(
@@ -306,14 +391,13 @@ val5 = uTransferFunctionEnd_doTransferFunction;
             expect(size).toBe(usedSize - 1);
             expect(color).toEqual(vec4.fromValues(1, 1, 1, 1));
           }
-          let position: number | Uint64;
+          let position: number | bigint;
           if (dataType !== DataType.UINT64) {
             const minValueNumber = minValue as number;
             const maxValueNumber = maxValue as number;
             position = (maxValueNumber + minValueNumber) / 2;
           } else {
-            const value = (maxValue as Uint64).toNumber() / 2;
-            position = Uint64.fromNumber(value);
+            position = (maxValue as bigint) / 2n;
           }
           const { color, size } = testShader(position);
           expect(size).toBe(usedSize - 1);

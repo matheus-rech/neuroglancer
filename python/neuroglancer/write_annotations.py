@@ -1,3 +1,17 @@
+# @license
+# Copyright 2025 Google Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Writes annotations in the Precomputed annotation format.
 
 This provides a simple way to write annotations in the precomputed format, but
@@ -20,7 +34,7 @@ import os
 import pathlib
 import struct
 from collections.abc import Sequence
-from typing import Literal, NamedTuple, Optional, Union, cast
+from typing import Literal, NamedTuple, cast
 
 import numpy as np
 
@@ -33,12 +47,10 @@ class Annotation(NamedTuple):
     relationships: Sequence[Sequence[int]]
 
 
-_PROPERTY_DTYPES: dict[
-    str, tuple[Union[tuple[str], tuple[str, tuple[int, ...]]], int]
-] = {
+_PROPERTY_DTYPES: dict[str, tuple[tuple[str] | tuple[str, tuple[int, ...]], int]] = {
     "uint8": (("|u1",), 1),
     "uint16": (("<u2",), 2),
-    "uint32": (("<u4",), 3),
+    "uint32": (("<u4",), 4),
     "int8": (("|i1",), 1),
     "int16": (("<i2",), 2),
     "int32": (("<i4",), 4),
@@ -47,11 +59,16 @@ _PROPERTY_DTYPES: dict[
     "rgba": (("|u1", (4,)), 1),
 }
 
-AnnotationType = Literal["point", "line", "axis_aligned_bounding_box", "ellipsoid"]
+AnnotationType = Literal[
+    "point", "line", "polyline", "axis_aligned_bounding_box", "ellipsoid"
+]
 
 
 def _get_dtype_for_geometry(annotation_type: AnnotationType, rank: int):
     geometry_size = rank if annotation_type == "point" else 2 * rank
+    if annotation_type == "polyline":
+        num_points = [("num_points", "<u4")]
+        return [num_points]
     return [("geometry", "<f4", geometry_size)]
 
 
@@ -79,9 +96,31 @@ def _get_dtype_for_properties(
     return dtype
 
 
+def _convert_rgb_to_uint8(rgb: str) -> tuple[int, int, int]:
+    """Convert an RGB hex string to a tuple of uint8 values."""
+    if rgb.startswith("#"):
+        rgb = rgb[1:]
+    if len(rgb) != 6:
+        raise ValueError(f"Invalid RGB format: {rgb}")
+    return (int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16))
+
+
+def _convert_rgba_to_uint8(rgba: str) -> tuple[int, int, int, int]:
+    """Convert an RGBA hex string to a tuple of uint8 values."""
+    if rgba.startswith("#"):
+        rgba = rgba[1:]
+    if len(rgba) != 8:
+        raise ValueError(f"Invalid RGBA format: {rgba}")
+    color = _convert_rgb_to_uint8(rgba[:6])
+    alpha = int(rgba[6:8], 16)
+    return (*color, alpha)
+
+
 class AnnotationWriter:
     annotations: list[Annotation]
     related_annotations: list[dict[int, list[Annotation]]]
+    lower_bound: np.typing.NDArray[np.float64]
+    upper_bound: np.typing.NDArray[np.float64]
 
     def __init__(
         self,
@@ -94,12 +133,14 @@ class AnnotationWriter:
         self.relationships = list(relationships)
         self.annotation_type = annotation_type
         self.properties = list(properties)
-        self.properties.sort(key=lambda p: -_PROPERTY_DTYPES[p.type][1])
+        self.properties_sorted = sorted(
+            self.properties, key=lambda p: -_PROPERTY_DTYPES[p.type][1]
+        )
         self.annotations = []
         self.rank = coordinate_space.rank
-        self.dtype = _get_dtype_for_geometry(
+        self._dtype = _get_dtype_for_geometry(
             annotation_type, coordinate_space.rank
-        ) + _get_dtype_for_properties(self.properties)
+        ) + _get_dtype_for_properties(self.properties_sorted)
         self.lower_bound = np.full(
             shape=(self.rank,), fill_value=float("inf"), dtype=np.float32
         )
@@ -108,7 +149,26 @@ class AnnotationWriter:
         )
         self.related_annotations = [{} for _ in self.relationships]
 
-    def add_point(self, point: Sequence[float], id: Optional[int] = None, **kwargs):
+    def get_dtype(self, annotation_size=None) -> np.dtype:
+        """
+        Prepares the dtype for the annotations.
+
+        Usually this is fixed, but for polylines we need to know the number of points
+        in the polyline to create the correct dtype.
+
+        Args:
+            annotation_size: The number of points in the polyline. Optional.
+        """
+        if self.annotation_type == "polyline" and annotation_size is not None:
+            geometry = ("geometry", "<f4", annotation_size)
+            num_points = ("num_points", "<u4")
+            return np.dtype(
+                [num_points, geometry]
+                + _get_dtype_for_properties(self.properties_sorted)
+            )
+        return self._dtype
+
+    def add_point(self, point: Sequence[float], id: int | None = None, **kwargs):
         if self.annotation_type != "point":
             raise ValueError(
                 f"Expected annotation type point, but received: {self.annotation_type}"
@@ -126,7 +186,7 @@ class AnnotationWriter:
         self,
         point_a: Sequence[float],
         point_b: Sequence[float],
-        id: Optional[int] = None,
+        id: int | None = None,
         **kwargs,
     ):
         if self.annotation_type != "axis_aligned_bounding_box":
@@ -139,7 +199,7 @@ class AnnotationWriter:
         self,
         point_a: Sequence[float],
         point_b: Sequence[float],
-        id: Optional[int] = None,
+        id: int | None = None,
         **kwargs,
     ):
         if self.annotation_type != "line":
@@ -148,11 +208,42 @@ class AnnotationWriter:
             )
         self._add_two_point_obj(point_a, point_b, id, **kwargs)
 
+    def add_ellipsoid(
+        self,
+        center: Sequence[float],
+        radii: Sequence[float],
+        id: int | None = None,
+        **kwargs,
+    ):
+        if self.annotation_type != "ellipsoid":
+            raise ValueError(
+                f"Expected annotation type ellipsoid, but received: {self.annotation_type}"
+            )
+        self._add_two_point_obj(center, radii, id, **kwargs)
+
+    def add_polyline(
+        self,
+        points: Sequence[Sequence[float]],
+        id: int | None = None,
+        **kwargs,
+    ):
+        if self.annotation_type != "polyline":
+            raise ValueError(
+                f"Expected annotation type polyline, but received: {self.annotation_type}"
+            )
+        if len(points) < 2:
+            raise ValueError("Expected at least two points for a polyline")
+        as_array = np.asarray(points)
+        self.lower_bound = np.minimum(self.lower_bound, as_array.min(axis=0))
+        self.upper_bound = np.maximum(self.upper_bound, as_array.max(axis=0))
+        geometry = np.concatenate(points)
+        self._add_obj(cast(Sequence[float], geometry), id, **kwargs)
+
     def _add_two_point_obj(
         self,
         point_a: Sequence[float],
         point_b: Sequence[float],
-        id: Optional[int] = None,
+        id: int | None = None,
         **kwargs,
     ):
         if len(point_a) != self.coordinate_space.rank:
@@ -170,13 +261,24 @@ class AnnotationWriter:
         coords = np.concatenate((point_a, point_b))
         self._add_obj(cast(Sequence[float], coords), id, **kwargs)
 
-    def _add_obj(self, coords: Sequence[float], id: Optional[int], **kwargs):
-        encoded = np.zeros(shape=(), dtype=self.dtype)
-        encoded[()]["geometry"] = coords
+    def _add_obj(self, coords: Sequence[float], id: int | None, **kwargs):
+        # We need to save the number of points
+        encoded = np.zeros(shape=(), dtype=self.get_dtype(len(coords)))
+        if self.annotation_type == "polyline":
+            encoded[()]["num_points"] = len(coords) // self.rank  # type: ignore[call-overload]
+        encoded[()]["geometry"] = coords  # type: ignore[call-overload]
 
-        for i, p in enumerate(self.properties):
+        for i, p in enumerate(self.properties_sorted):
+            default_value = p.default
             if p.id in kwargs:
-                encoded[()][f"property{i}"] = kwargs.pop(p.id)
+                default_value = kwargs.pop(p.id)
+            if isinstance(default_value, str) and p.type in ("rgb", "rgba"):
+                if p.type == "rgb":
+                    default_value = _convert_rgb_to_uint8(default_value)
+                else:
+                    default_value = _convert_rgba_to_uint8(default_value)
+            if default_value is not None:
+                encoded[()][f"property{i}"] = default_value  # type: ignore[call-overload]
 
         related_ids = []
         for relationship in self.relationships:
@@ -219,7 +321,7 @@ class AnnotationWriter:
             for related_id in related_ids:
                 f.write(struct.pack("<Q", related_id))
 
-    def write(self, path: Union[str, pathlib.Path]):
+    def write(self, path: str | pathlib.Path):
         metadata = {
             "@type": "neuroglancer_annotations_v1",
             "dimensions": self.coordinate_space.to_json(),

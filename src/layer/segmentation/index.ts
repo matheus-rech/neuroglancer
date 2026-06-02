@@ -22,7 +22,7 @@ import type { DataSourceSpecification } from "#src/datasource/index.js";
 import {
   LocalDataSource,
   localEquivalencesUrl,
-} from "#src/datasource/index.js";
+} from "#src/datasource/local.js";
 import type { LayerActionContext, ManagedUserLayer } from "#src/layer/index.js";
 import {
   LinkedLayerGroup,
@@ -45,7 +45,7 @@ import {
   RenderScaleHistogram,
   trackableRenderScaleTarget,
 } from "#src/render_scale_statistics.js";
-import { SegmentColorHash } from "#src/segment_color.js";
+import { getCssColor, SegmentColorHash } from "#src/segment_color.js";
 import type {
   SegmentationColorGroupState,
   SegmentationDisplayState,
@@ -54,6 +54,7 @@ import type {
 import {
   augmentSegmentId,
   bindSegmentListWidth,
+  getBaseObjectColor,
   makeSegmentWidget,
   maybeAugmentSegmentId,
   registerCallbackWhenSegmentationDisplayStateChanged,
@@ -95,6 +96,7 @@ import {
   IndirectWatchableValue,
   makeCachedDerivedWatchableValue,
   makeCachedLazyDerivedWatchableValue,
+  observeWatchable,
   registerNestedSync,
   TrackableValue,
   WatchableValue,
@@ -120,16 +122,18 @@ import { RefCounted } from "#src/util/disposable.js";
 import type { vec3, vec4 } from "#src/util/geom.js";
 import {
   parseArray,
+  parseUint64,
   verifyFiniteNonNegativeFloat,
   verifyObjectAsMap,
   verifyOptionalObjectProperty,
   verifyString,
 } from "#src/util/json.js";
 import { Signal } from "#src/util/signal.js";
-import { Uint64 } from "#src/util/uint64.js";
 import { makeWatchableShaderError } from "#src/webgl/dynamic_shader.js";
 import type { DependentViewContext } from "#src/widget/dependent_view_widget.js";
 import { registerLayerShaderControlsTool } from "#src/widget/shader_controls.js";
+
+const MAX_LAYER_BAR_UI_INDICATOR_COLORS = 6;
 
 export class SegmentationUserLayerGroupState
   extends RefCounted
@@ -142,7 +146,40 @@ export class SegmentationUserLayerGroupState
     this.hideSegmentZero.changed.add(specificationChanged.dispatch);
     this.segmentQuery.changed.add(specificationChanged.dispatch);
 
-    const { visibleSegments, selectedSegments } = this;
+    const { selectedSegments } = this;
+    const visibleSegments = (this.visibleSegments = this.registerDisposer(
+      Uint64Set.makeWithCounterpart(layer.manager.rpc),
+    ));
+    this.segmentEquivalences = this.registerDisposer(
+      SharedDisjointUint64Sets.makeWithCounterpart(
+        layer.manager.rpc,
+        layer.registerDisposer(
+          makeCachedDerivedWatchableValue(
+            (x) =>
+              x?.visibleSegmentEquivalencePolicy ||
+              VisibleSegmentEquivalencePolicy.MIN_REPRESENTATIVE,
+            [this.graph],
+          ),
+        ),
+      ),
+    );
+
+    this.temporaryVisibleSegments = layer.registerDisposer(
+      Uint64Set.makeWithCounterpart(layer.manager.rpc),
+    );
+    this.temporarySegmentEquivalences = layer.registerDisposer(
+      SharedDisjointUint64Sets.makeWithCounterpart(
+        layer.manager.rpc,
+        this.segmentEquivalences.disjointSets.visibleSegmentEquivalencePolicy,
+      ),
+    );
+    this.useTemporaryVisibleSegments = layer.registerDisposer(
+      SharedWatchableValue.make(layer.manager.rpc, false),
+    );
+    this.useTemporarySegmentEquivalences = layer.registerDisposer(
+      SharedWatchableValue.make(layer.manager.rpc, false),
+    );
+
     visibleSegments.changed.add(specificationChanged.dispatch);
     selectedSegments.changed.add(specificationChanged.dispatch);
     selectedSegments.changed.add((x, add) => {
@@ -188,7 +225,7 @@ export class SegmentationUserLayerGroupState
           if (hidden) {
             stringValue = stringValue.substring(1);
           }
-          const id = Uint64.parseString(stringValue, 10);
+          const id = parseUint64(stringValue);
           const segmentId = segmentEquivalences.get(id);
           selectedSegments.add(segmentId);
           if (!hidden) {
@@ -235,48 +272,23 @@ export class SegmentationUserLayerGroupState
   }
 
   localGraph = new LocalSegmentationGraphSource();
-  visibleSegments = this.registerDisposer(
-    Uint64Set.makeWithCounterpart(this.layer.manager.rpc),
-  );
+  visibleSegments: Uint64Set;
   selectedSegments = this.registerDisposer(new Uint64OrderedSet());
 
   segmentPropertyMap = new WatchableValue<
     PreprocessedSegmentPropertyMap | undefined
   >(undefined);
   graph = new WatchableValue<SegmentationGraphSource | undefined>(undefined);
-  segmentEquivalences = this.registerDisposer(
-    SharedDisjointUint64Sets.makeWithCounterpart(
-      this.layer.manager.rpc,
-      this.layer.registerDisposer(
-        makeCachedDerivedWatchableValue(
-          (x) =>
-            x?.visibleSegmentEquivalencePolicy ||
-            VisibleSegmentEquivalencePolicy.MIN_REPRESENTATIVE,
-          [this.graph],
-        ),
-      ),
-    ),
-  );
+  segmentEquivalences: SharedDisjointUint64Sets;
   localSegmentEquivalences = false;
   maxIdLength = new WatchableValue(1);
   hideSegmentZero = new TrackableBoolean(true, true);
   segmentQuery = new TrackableValue<string>("", verifyString);
 
-  temporaryVisibleSegments = this.layer.registerDisposer(
-    Uint64Set.makeWithCounterpart(this.layer.manager.rpc),
-  );
-  temporarySegmentEquivalences = this.layer.registerDisposer(
-    SharedDisjointUint64Sets.makeWithCounterpart(
-      this.layer.manager.rpc,
-      this.segmentEquivalences.disjointSets.visibleSegmentEquivalencePolicy,
-    ),
-  );
-  useTemporaryVisibleSegments = this.layer.registerDisposer(
-    SharedWatchableValue.make(this.layer.manager.rpc, false),
-  );
-  useTemporarySegmentEquivalences = this.layer.registerDisposer(
-    SharedWatchableValue.make(this.layer.manager.rpc, false),
-  );
+  temporaryVisibleSegments: Uint64Set;
+  temporarySegmentEquivalences: SharedDisjointUint64Sets;
+  useTemporaryVisibleSegments: SharedWatchableValue<boolean>;
+  useTemporarySegmentEquivalences: SharedWatchableValue<boolean>;
 }
 
 export class SegmentationUserLayerColorGroupState
@@ -314,8 +326,8 @@ export class SegmentationUserLayerColorGroupState
           parseRGBColorSpecification(String(x)),
         );
         for (const [idStr, colorVec] of result) {
-          const id = Uint64.parseString(String(idStr));
-          const color = new Uint64(packColor(colorVec));
+          const id = parseUint64(idStr);
+          const color = BigInt(packColor(colorVec));
           this.segmentStatedColors.set(id, color);
         }
       },
@@ -330,8 +342,8 @@ export class SegmentationUserLayerColorGroupState
     const { segmentStatedColors } = this;
     if (segmentStatedColors.size > 0) {
       const j: any = (x[json_keys.SEGMENT_STATED_COLORS_JSON_KEY] = {});
-      for (const [key, value] of segmentStatedColors.unsafeEntries()) {
-        j[key.toString()] = serializeColor(unpackRGB(value.low));
+      for (const [key, value] of segmentStatedColors) {
+        j[key.toString()] = serializeColor(unpackRGB(Number(value)));
       }
     }
     return x;
@@ -403,6 +415,41 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
     // Even though `SegmentationUserLayer` assigns this to its `displayState` property, redundantly
     // assign it here first in order to allow it to be accessed by `segmentationGroupState`.
     layer.displayState = this;
+
+    this.linkedSegmentationGroup = layer.registerDisposer(
+      new LinkedLayerGroup(
+        layer.manager.rootLayers,
+        layer,
+        (userLayer) => userLayer instanceof SegmentationUserLayer,
+        (userLayer: SegmentationUserLayer) =>
+          userLayer.displayState.linkedSegmentationGroup,
+      ),
+    );
+
+    this.linkedSegmentationColorGroup = this.layer.registerDisposer(
+      new LinkedLayerGroup(
+        layer.manager.rootLayers,
+        layer,
+        (userLayer) => userLayer instanceof SegmentationUserLayer,
+        (userLayer: SegmentationUserLayer) =>
+          userLayer.displayState.linkedSegmentationColorGroup,
+      ),
+    );
+
+    this.originalSegmentationGroupState = layer.registerDisposer(
+      new SegmentationUserLayerGroupState(layer),
+    );
+
+    this.originalSegmentationColorGroupState = layer.registerDisposer(
+      new SegmentationUserLayerColorGroupState(layer),
+    );
+
+    this.transparentPickEnabled = layer.pick;
+
+    this.useTempSegmentStatedColors2d = layer.registerDisposer(
+      SharedWatchableValue.make(layer.manager.rpc, false),
+    );
+
     this.segmentationGroupState = this.layer.registerDisposer(
       new LinkedSegmentationGroupState<SegmentationUserLayerGroupState>(
         this.linkedSegmentationGroup,
@@ -415,6 +462,9 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
         "originalSegmentationColorGroupState",
       ),
     );
+
+    this.selectSegment = layer.selectSegment;
+    this.filterBySegmentLabel = layer.filterBySegmentLabel;
 
     this.hideSegmentZero = this.layer.registerDisposer(
       new IndirectWatchableValue(
@@ -488,47 +538,23 @@ class SegmentationUserLayerDisplayState implements SegmentationDisplayState {
   shaderError = makeWatchableShaderError();
   renderScaleHistogram = new RenderScaleHistogram();
   renderScaleTarget = trackableRenderScaleTarget(1);
-  selectSegment = this.layer.selectSegment;
-  transparentPickEnabled = this.layer.pick;
+  selectSegment: (id: bigint, pin: boolean | "toggle") => void;
+  transparentPickEnabled: TrackableBoolean;
   baseSegmentColoring = new TrackableBoolean(false, false);
   baseSegmentHighlighting = new TrackableBoolean(false, false);
-  useTempSegmentStatedColors2d = this.layer.registerDisposer(
-    SharedWatchableValue.make(this.layer.manager.rpc, false),
-  );
+  useTempSegmentStatedColors2d: SharedWatchableValue<boolean>;
+  hasVolume = new TrackableBoolean(false, false);
 
-  filterBySegmentLabel = this.layer.filterBySegmentLabel;
+  filterBySegmentLabel: (id: bigint) => void;
 
-  moveToSegment = (id: Uint64) => {
+  moveToSegment = (id: bigint) => {
     this.layer.moveToSegment(id);
   };
 
-  linkedSegmentationGroup: LinkedLayerGroup = this.layer.registerDisposer(
-    new LinkedLayerGroup(
-      this.layer.manager.rootLayers,
-      this.layer,
-      (userLayer) => userLayer instanceof SegmentationUserLayer,
-      (userLayer: SegmentationUserLayer) =>
-        userLayer.displayState.linkedSegmentationGroup,
-    ),
-  );
-
-  linkedSegmentationColorGroup: LinkedLayerGroup = this.layer.registerDisposer(
-    new LinkedLayerGroup(
-      this.layer.manager.rootLayers,
-      this.layer,
-      (userLayer) => userLayer instanceof SegmentationUserLayer,
-      (userLayer: SegmentationUserLayer) =>
-        userLayer.displayState.linkedSegmentationColorGroup,
-    ),
-  );
-
-  originalSegmentationGroupState = this.layer.registerDisposer(
-    new SegmentationUserLayerGroupState(this.layer),
-  );
-
-  originalSegmentationColorGroupState = this.layer.registerDisposer(
-    new SegmentationUserLayerColorGroupState(this.layer),
-  );
+  linkedSegmentationGroup: LinkedLayerGroup;
+  linkedSegmentationColorGroup: LinkedLayerGroup;
+  originalSegmentationGroupState: SegmentationUserLayerGroupState;
+  originalSegmentationColorGroupState: SegmentationUserLayerColorGroupState;
 
   segmentationGroupState: WatchableValueInterface<SegmentationUserLayerGroupState>;
   segmentationColorGroupState: WatchableValueInterface<SegmentationUserLayerColorGroupState>;
@@ -557,6 +583,7 @@ const Base = UserLayerWithAnnotationsMixin(UserLayer);
 export class SegmentationUserLayer extends Base {
   sliceViewRenderScaleHistogram = new RenderScaleHistogram();
   sliceViewRenderScaleTarget = trackableRenderScaleTarget(1);
+  codeVisible = new TrackableBoolean(true);
 
   graphConnection = new WatchableValue<
     SegmentationGraphSourceConnection | undefined
@@ -568,18 +595,18 @@ export class SegmentationUserLayer extends Base {
 
   segmentQueryFocusTime = new WatchableValue<number>(Number.NEGATIVE_INFINITY);
 
-  selectSegment = (id: Uint64, pin: boolean | "toggle") => {
+  selectSegment = (id: bigint, pin: boolean | "toggle" | "force-unpin") => {
     this.manager.root.selectionState.captureSingleLayerState(
       this,
       (state) => {
-        state.value = id.clone();
+        state.value = id;
         return true;
       },
       pin,
     );
   };
 
-  filterBySegmentLabel = (id: Uint64) => {
+  filterBySegmentLabel = (id: bigint) => {
     const augmented = augmentSegmentId(this.displayState, id);
     const { label } = augmented;
     if (!label) return;
@@ -595,12 +622,13 @@ export class SegmentationUserLayer extends Base {
 
   displayState = new SegmentationUserLayerDisplayState(this);
 
-  anchorSegment = new TrackableValue<Uint64 | undefined>(undefined, (x) =>
-    x === undefined ? undefined : Uint64.parseString(x),
+  anchorSegment = new TrackableValue<bigint | undefined>(undefined, (x) =>
+    x === undefined ? undefined : parseUint64(x),
   );
 
   constructor(managedLayer: Borrowed<ManagedUserLayer>) {
     super(managedLayer);
+    this.codeVisible.changed.add(this.specificationChanged.dispatch);
     this.registerDisposer(
       registerNestedSync((context, group) => {
         context.registerDisposer(
@@ -718,11 +746,21 @@ export class SegmentationUserLayer extends Base {
     ),
   );
 
+  readonly getSkeletonLayer = () => {
+    for (const layer of this.renderLayers) {
+      if (layer instanceof PerspectiveViewSkeletonLayer) {
+        return layer.base;
+      }
+    }
+    return undefined;
+  };
+
   activateDataSubsources(subsources: Iterable<LoadedDataSubsource>) {
     const updatedSegmentPropertyMaps: SegmentPropertyMap[] = [];
     const isGroupRoot =
       this.displayState.linkedSegmentationGroup.root.value === this;
     let updatedGraph: SegmentationGraphSource | undefined;
+    let hasVolume = false;
     for (const loadedSubsource of subsources) {
       if (this.addStaticAnnotations(loadedSubsource)) continue;
       const { volume, mesh, segmentPropertyMap, segmentationGraph, local } =
@@ -735,6 +773,7 @@ export class SegmentationUserLayer extends Base {
             );
             continue;
         }
+        hasVolume = true;
         loadedSubsource.activate(
           () =>
             loadedSubsource.addRenderLayer(
@@ -857,6 +896,7 @@ export class SegmentationUserLayer extends Base {
         updatedSegmentPropertyMaps,
       );
     this.displayState.originalSegmentationGroupState.graph.value = updatedGraph;
+    this.displayState.hasVolume.value = hasVolume;
   }
 
   getLegacyDataSourceSpecifications(
@@ -965,6 +1005,7 @@ export class SegmentationUserLayer extends Base {
     if (skeletonShader !== undefined) {
       skeletonRenderingOptions.shader.restoreState(skeletonShader);
     }
+    this.codeVisible.restoreState(json_keys.SKELETON_CODE_VISIBLE_KEY);
     this.displayState.renderScaleTarget.restoreState(
       specification[json_keys.MESH_RENDER_SCALE_JSON_KEY],
     );
@@ -1017,9 +1058,12 @@ export class SegmentationUserLayer extends Base {
       this.displayState.ignoreNullVisibleSet.toJSON();
     x[json_keys.MESH_SILHOUETTE_RENDERING_JSON_KEY] =
       this.displayState.silhouetteRendering.toJSON();
-    x[json_keys.ANCHOR_SEGMENT_JSON_KEY] = this.anchorSegment.toJSON();
+    x[json_keys.ANCHOR_SEGMENT_JSON_KEY] = this.anchorSegment
+      .toJSON()
+      ?.toString();
     x[json_keys.SKELETON_RENDERING_JSON_KEY] =
       this.displayState.skeletonRenderingOptions.toJSON();
+    x[json_keys.SKELETON_CODE_VISIBLE_KEY] = this.codeVisible.toJSON();
     x[json_keys.MESH_RENDER_SCALE_JSON_KEY] =
       this.displayState.renderScaleTarget.toJSON();
     x[json_keys.CROSS_SECTION_RENDER_SCALE_JSON_KEY] =
@@ -1054,8 +1098,7 @@ export class SegmentationUserLayer extends Base {
     if (value == null) {
       return value;
     }
-    // Must copy, because `value` may be a temporary Uint64 returned by PickIDManager.
-    return maybeAugmentSegmentId(this.displayState, value, /*mustCopy=*/ true);
+    return maybeAugmentSegmentId(this.displayState, value);
   }
 
   handleAction(action: string, context: SegmentationActionContext) {
@@ -1099,13 +1142,12 @@ export class SegmentationUserLayer extends Base {
   }
   selectionStateFromJson(state: this["selectionState"], json: any) {
     super.selectionStateFromJson(state, json);
-    const v = new Uint64();
     let { value } = state;
     if (typeof value === "number") value = value.toString();
-    if (typeof value !== "string" || !v.tryParseString(value)) {
+    try {
+      state.value = parseUint64(value);
+    } catch {
       state.value = undefined;
-    } else {
-      state.value = v;
     }
   }
   selectionStateToJson(state: this["selectionState"], forPython: boolean): any {
@@ -1121,7 +1163,7 @@ export class SegmentationUserLayer extends Base {
       } else {
         json.value = (value.value || value.key).toString();
       }
-    } else if (value instanceof Uint64) {
+    } else if (typeof value === "bigint") {
       json.value = value.toString();
     }
     return json;
@@ -1133,15 +1175,18 @@ export class SegmentationUserLayer extends Base {
     context: DependentViewContext,
   ): boolean {
     const { value } = state;
-    let id: Uint64;
+    let id: bigint;
     if (typeof value === "number" || typeof value === "string") {
-      id = new Uint64();
-      if (!id.tryParseString(value.toString())) return false;
+      try {
+        id = parseUint64(value);
+      } catch {
+        return false;
+      }
     }
-    if (value instanceof Uint64) {
-      id = value.clone();
+    if (typeof value === "bigint") {
+      id = value;
     } else if (value instanceof Uint64MapEntry) {
-      id = value.key.clone();
+      id = value.key;
     } else {
       return false;
     }
@@ -1227,7 +1272,7 @@ export class SegmentationUserLayer extends Base {
     return displayed;
   }
 
-  moveToSegment(id: Uint64) {
+  moveToSegment(id: bigint) {
     for (const layer of this.renderLayers) {
       if (
         !(layer instanceof MultiscaleMeshLayer || layer instanceof MeshLayer)
@@ -1261,9 +1306,90 @@ export class SegmentationUserLayer extends Base {
     );
   }
 
+  observeLayerColor(callback: () => void) {
+    const disposer = super.observeLayerColor(callback);
+    const defaultColorDisposer = observeWatchable(
+      callback,
+      this.displayState.segmentDefaultColor,
+    );
+    const visibleSegmentDisposer =
+      this.displayState.segmentationGroupState.value.visibleSegments.changed.add(
+        callback,
+      );
+    const colorHashChangeDisposer =
+      this.displayState.segmentationColorGroupState.value.segmentColorHash.changed.add(
+        callback,
+      );
+    const showAllByDefaultDisposer =
+      this.displayState.ignoreNullVisibleSet.changed.add(callback);
+    const hasVolumeDisposer = this.displayState.hasVolume.changed.add(callback);
+    return () => {
+      disposer();
+      defaultColorDisposer();
+      visibleSegmentDisposer();
+      colorHashChangeDisposer();
+      showAllByDefaultDisposer();
+      hasVolumeDisposer();
+    };
+  }
+
+  get automaticLayerBarColors() {
+    const { displayState } = this;
+    const visibleSegmentsSet =
+      displayState.segmentationGroupState.value.visibleSegments;
+    const fixedColor = displayState.segmentDefaultColor.value;
+
+    const noVisibleSegments = visibleSegmentsSet.size === 0;
+    const tooManyVisibleSegments =
+      visibleSegmentsSet.size > MAX_LAYER_BAR_UI_INDICATOR_COLORS;
+    const hasMappedColors =
+      displayState.segmentationColorGroupState.value.segmentStatedColors.size >
+      0;
+    const isFixedColorOnly = fixedColor !== undefined && !hasMappedColors;
+    const showAllByDefault = displayState.ignoreNullVisibleSet.value;
+    const hasVolume = displayState.hasVolume.value;
+
+    if (noVisibleSegments) {
+      if (!showAllByDefault || !hasVolume) return []; // No segments visible
+      if (isFixedColorOnly) return [getCssColor(fixedColor)];
+      return undefined; // Rainbow colors
+    }
+    if (isFixedColorOnly) {
+      return [getCssColor(fixedColor)]; // All segments show as one color
+    }
+
+    // Because manually mapped colors are not guaranteed to be unique,
+    // we need to actually check all the visible segments if
+    // manually mapped colors are used
+    if (!hasMappedColors && tooManyVisibleSegments) {
+      return undefined; // Too many segments to show
+    }
+
+    const visibleSegments = [...visibleSegmentsSet];
+    const colors = visibleSegments.map((id) => {
+      const color = getCssColor(getBaseObjectColor(displayState, id));
+      return { color, id };
+    });
+
+    // Sort the colors by their segment ID
+    // Otherwise, the order is random which is a bit confusing in the UI
+    colors.sort((a, b) => {
+      const aId = a.id;
+      const bId = b.id;
+      return aId < bId ? -1 : aId > bId ? 1 : 0;
+    });
+
+    const uniqueColors = [...new Set(colors.map((color) => color.color))];
+    if (uniqueColors.length > MAX_LAYER_BAR_UI_INDICATOR_COLORS) {
+      return undefined; // Too many colors to show
+    }
+    return uniqueColors;
+  }
+
   static type = "segmentation";
   static typeAbbreviation = "seg";
   static supportsPickOption = true;
+  static supportsLayerBarColorSyncOption = true;
 }
 
 registerLayerControls(SegmentationUserLayer);

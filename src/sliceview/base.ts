@@ -28,8 +28,8 @@ import type {
 import { DATA_TYPE_BYTES, DataType } from "#src/util/data_type.js";
 import type { Disposable } from "#src/util/disposable.js";
 import {
-  getFrustrumPlanes,
-  getViewFrustrumDepthRange,
+  getFrustumPlanes,
+  getViewFrustumDepthRange,
   isAABBIntersectingPlane,
   isAABBVisible,
   mat4,
@@ -184,7 +184,8 @@ function updateFixedCurPositionInChunks<
 ): boolean {
   const { curPositionInChunks, fixedPositionWithinChunk } = tsource;
   const { nonDisplayLowerClipBound, nonDisplayUpperClipBound } = tsource;
-  const { rank, chunkDataSize } = tsource.source.spec;
+  const { rank, chunkDataSize, lowerChunkBound, upperChunkBound } =
+    tsource.source.spec;
   if (
     !getChunkPositionFromCombinedGlobalLocalPositions(
       curPositionInChunks,
@@ -196,11 +197,14 @@ function updateFixedCurPositionInChunks<
   ) {
     return false;
   }
+  // Fraction by which non-display dimensions can be outside clip bounds, to
+  // account for floating-point imprecision.
+  const EPSILON = 1e-3;
   for (let chunkDim = 0; chunkDim < rank; ++chunkDim) {
     const x = curPositionInChunks[chunkDim];
     if (
-      x < nonDisplayLowerClipBound[chunkDim] ||
-      x >= nonDisplayUpperClipBound[chunkDim]
+      x < nonDisplayLowerClipBound[chunkDim] - EPSILON ||
+      x > nonDisplayUpperClipBound[chunkDim] + EPSILON
     ) {
       if (DEBUG_VISIBLE_SOURCES) {
         console.log(
@@ -215,7 +219,13 @@ function updateFixedCurPositionInChunks<
       return false;
     }
     const chunkSize = chunkDataSize[chunkDim];
-    const chunk = (curPositionInChunks[chunkDim] = Math.floor(x / chunkSize));
+    // Given that clip bounds are already tested above, clamp chunk index to its
+    // bounds, to ensure floating-point imprecision does not result in an
+    // out-of-bounds index.
+    const chunk = (curPositionInChunks[chunkDim] = Math.min(
+      upperChunkBound[chunkDim] - 1,
+      Math.max(lowerChunkBound[chunkDim], Math.floor(x / chunkSize)),
+    ));
     fixedPositionWithinChunk[chunkDim] = x - chunk * chunkSize;
   }
   return true;
@@ -717,6 +727,9 @@ export function* filterVisibleSources(
   };
   let scaleIndex = sources.length - 1;
   let prevVoxelSize: vec3 | undefined;
+  if (DEBUG_VISIBLE_SOURCES) {
+    console.log(`Filtering ${sources.length} visible sources`);
+  }
   while (true) {
     const transformedSource = sources[scaleIndex];
     if (
@@ -726,14 +739,27 @@ export function* filterVisibleSources(
         prevVoxelSize,
       )
     ) {
+      if (DEBUG_VISIBLE_SOURCES) {
+        console.log(
+          `  Stopping at ${scaleIndex} because can't improve on prev voxel size: effectiveVoxelSize=${transformedSource.effectiveVoxelSize} prevVoxelSize=${prevVoxelSize}`,
+        );
+      }
       break;
     }
     yield transformedSource;
 
-    if (
-      scaleIndex === 0 ||
-      !canImproveOnVoxelSize(transformedSource.effectiveVoxelSize)
-    ) {
+    if (scaleIndex === 0) {
+      if (DEBUG_VISIBLE_SOURCES) {
+        console.log(`  Stopping because scaleIndex=0`);
+      }
+      break;
+    }
+    if (!canImproveOnVoxelSize(transformedSource.effectiveVoxelSize)) {
+      if (DEBUG_VISIBLE_SOURCES) {
+        console.log(
+          `Stopping at at ${scaleIndex} because can't improve on voxel size ${transformedSource.effectiveVoxelSize}`,
+        );
+      }
       break;
     }
     prevVoxelSize = transformedSource.effectiveVoxelSize;
@@ -783,7 +809,7 @@ const tempVisibleVolumetricChunkUpper = new Float32Array(3);
 const tempVisibleVolumetricModelViewProjection = mat4.create();
 const tempVisibleVolumetricClippingPlanes = new Float32Array(24);
 
-function forEachVolumetricChunkWithinFrustrum<
+function forEachVolumetricChunkWithinFrustum<
   RLayer extends MultiscaleVolumetricDataRenderLayer,
 >(
   clippingPlanes: Float32Array,
@@ -887,12 +913,12 @@ export function forEachVisibleVolumetricChunk<
   }
 
   const clippingPlanes = tempVisibleVolumetricClippingPlanes;
-  getFrustrumPlanes(clippingPlanes, modelViewProjection);
+  getFrustumPlanes(clippingPlanes, modelViewProjection);
   const lower = tempVisibleVolumetricChunkLower;
   const upper = tempVisibleVolumetricChunkUpper;
   lower.fill(Number.NEGATIVE_INFINITY);
   upper.fill(Number.POSITIVE_INFINITY);
-  forEachVolumetricChunkWithinFrustrum(
+  forEachVolumetricChunkWithinFrustum(
     clippingPlanes,
     transformedSource,
     callback,
@@ -931,18 +957,31 @@ export function forEachPlaneIntersectingVolumetricChunk<
     }
   }
 
+  const { upperChunkDisplayBound } = transformedSource;
+
   const invModelViewProjection = tempMat4;
   mat4.invert(invModelViewProjection, modelViewProjection);
   const lower = tempVisibleVolumetricChunkLower;
   const upper = tempVisibleVolumetricChunkUpper;
-  const epsilon = 1e-3;
+  const BIAS_EPSILON = 1e-4;
+  const BOUND_EPSILON = 1e-3;
   for (let i = 0; i < 3; ++i) {
     // Add small offset of `epsilon` voxels to bias towards the higher coordinate if very close to a
     // voxel boundary.
-    const c = invModelViewProjection[12 + i] + epsilon / chunkSize[i];
+    const c = invModelViewProjection[12 + i] + BIAS_EPSILON / chunkSize[i];
     const xCoeff = Math.abs(invModelViewProjection[i]);
     const yCoeff = Math.abs(invModelViewProjection[4 + i]);
-    lower[i] = Math.floor(c - xCoeff - yCoeff);
+
+    const upperBound = upperChunkDisplayBound[i];
+    let lowerValue = c - xCoeff - yCoeff;
+    if (lowerValue >= upperBound && lowerValue < upperBound + BOUND_EPSILON) {
+      // Lower bound of the viewport is within `BOUND_EPSILON` of the upper
+      // chunk bound. Try to ensure that data is still shown in this case.
+      lowerValue = upperBound - 1;
+    } else {
+      lowerValue = Math.floor(lowerValue);
+    }
+    lower[i] = lowerValue;
     upper[i] = Math.floor(c + xCoeff + yCoeff + 1);
   }
 
@@ -975,7 +1014,7 @@ export function forEachPlaneIntersectingVolumetricChunk<
     console.log("modelViewProjection", modelViewProjection.join(","));
     console.log(`lower=${lower.join(",")}, upper=${upper.join(",")}`);
   }
-  forEachVolumetricChunkWithinFrustrum(
+  forEachVolumetricChunkWithinFrustum(
     clippingPlanes,
     transformedSource,
     callback,
@@ -1002,7 +1041,7 @@ export function getNormalizedChunkLayout(
   );
   tempChunkLayout.detTransform = chunkLayout.detTransform;
   const { invViewMatrix, width, height } = projectionParameters;
-  const depth = getViewFrustrumDepthRange(projectionParameters.projectionMat);
+  const depth = getViewFrustumDepthRange(projectionParameters.projectionMat);
   for (let chunkRenderDim = finiteRank; chunkRenderDim < 3; ++chunkRenderDim) {
     // we want to ensure chunk [0] fully covers the viewport
     const offset = invViewMatrix[12 + chunkRenderDim];

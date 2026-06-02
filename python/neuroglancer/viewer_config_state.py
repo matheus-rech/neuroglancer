@@ -14,9 +14,8 @@
 
 
 import base64
-import collections
 import io
-import numbers
+import os
 import traceback
 
 import numpy as np
@@ -26,57 +25,75 @@ from .json_wrappers import (
     JsonObjectWrapper,
     array_wrapper,
     optional,
-    text_type,
     typed_list,
+    typed_map,
     typed_set,
-    typed_string_map,
     wrapped_property,
 )
+from .viewer_state import LayerSelectedValues, LayerSelectionState, SegmentIdMapEntry
 
 _uint64_keys = frozenset(["t", "v"])
 _map_entry_keys = frozenset(["key", "value"])
 
 
-class SegmentIdMapEntry(
-    collections.namedtuple("SegmentIdMapEntry", ["key", "value", "label"])
-):
-    def __new__(cls, key, value=None, label=None):
-        return super().__new__(cls, key, value, label)
+_BUILDING_DOCS = os.environ.get("NEUROGLANCER_BUILDING_DOCS") == "1"
 
 
-def layer_selected_value(x):
-    if isinstance(x, numbers.Number):
-        return x
-    if isinstance(x, str):
-        return int(x)
-    if isinstance(x, dict):
-        value = x.get("value")
-        if value is not None:
-            value = int(value)
-        return SegmentIdMapEntry(int(x["key"]), value, x.get("label"))
-    return None
+__all__ = [
+    # Rexported for backwards compatibility
+    "LayerSelectedValues",
+    # Rexported for backwards compatibility
+    "SegmentIdMapEntry",
+    # Rexported for backwards compatibility
+    "LayerSelectionState",
+]
 
 
-class LayerSelectionState(JsonObjectWrapper):
+def export(obj):
+    __all__.append(obj.__name__)
+    return obj
+
+
+@export
+class PanelResolutionData(JsonObjectWrapper):
     __slots__ = ()
-    supports_validation = True
-    local_position = wrapped_property(
-        "localPosition", optional(array_wrapper(np.float32))
+    type = wrapped_property("type", str)
+    width = wrapped_property("width", int)
+    height = wrapped_property("height", int)
+    resolution = wrapped_property("resolution", str)
+
+
+@export
+class LayerResolutionData(JsonObjectWrapper):
+    __slots__ = ()
+    name = wrapped_property("name", str)
+    type = wrapped_property("type", str)
+    resolution = wrapped_property("resolution", str)
+
+
+@export
+class ScreenshotResolutionMetadata(JsonObjectWrapper):
+    __slots__ = ()
+    panel_resolution_data = panelResolutionData = wrapped_property(
+        "panelResolutionData", typed_list(PanelResolutionData)
     )
-    value = wrapped_property("value", optional(layer_selected_value))
+    layer_resolution_data = layerResolutionData = wrapped_property(
+        "layerResolutionData", typed_list(LayerResolutionData)
+    )
 
 
-LayerSelectedValues = typed_string_map(LayerSelectionState)
-
-
+@export
 class ScreenshotReply(JsonObjectWrapper):
     __slots__ = ()
-    id = wrapped_property("id", text_type)
+    id = wrapped_property("id", str)
     image = wrapped_property("image", base64.b64decode)
     width = wrapped_property("width", int)
     height = wrapped_property("height", int)
-    image_type = imageType = wrapped_property("imageType", text_type)
+    image_type = imageType = wrapped_property("imageType", str)
     depth_data = depthData = wrapped_property("depthData", optional(base64.b64decode))
+    resolution_metadata = resolutionMetadata = wrapped_property(
+        "resolutionMetadata", ScreenshotResolutionMetadata
+    )
 
     @property
     def image_pixels(self):
@@ -94,6 +111,7 @@ class ScreenshotReply(JsonObjectWrapper):
         return np.frombuffer(depth_data, dtype="<f4").reshape((self.height, self.width))
 
 
+@export
 class AggregateChunkSourceStatistics(JsonObjectWrapper):
     __slots__ = ()
     visible_chunks_total = visibleChunksTotal = wrapped_property(
@@ -112,14 +130,16 @@ class AggregateChunkSourceStatistics(JsonObjectWrapper):
     download_latency = downloadLatency = wrapped_property("downloadLatency", float)
 
 
+@export
 class ChunkSourceStatistics(JsonObjectWrapper):
     __slots__ = ()
-    distinct_id = distinctId = wrapped_property("distinctId", text_type)
+    distinct_id = distinctId = wrapped_property("distinctId", str)
 
 
+@export
 class ScreenshotStatistics(JsonObjectWrapper):
     __slots__ = ()
-    id = wrapped_property("id", text_type)
+    id = wrapped_property("id", str)
 
     chunk_sources = chunkSources = wrapped_property(
         "chunkSources", typed_list(ChunkSourceStatistics)
@@ -127,6 +147,7 @@ class ScreenshotStatistics(JsonObjectWrapper):
     total = wrapped_property("total", AggregateChunkSourceStatistics)
 
 
+@export
 class ActionState(JsonObjectWrapper):
     __slots__ = ()
     viewer_state = viewerState = wrapped_property(
@@ -144,6 +165,7 @@ class ActionState(JsonObjectWrapper):
     )
 
 
+@export
 class Actions:
     def __init__(self, set_config):
         self._action_handlers = dict()
@@ -183,9 +205,10 @@ class Actions:
                     traceback.print_exc()
 
 
-EventActionMap = typed_string_map(text_type)
+EventActionMap = typed_map(str, str)
 
 
+@export
 class InputEventBindings(JsonObjectWrapper):
     __slots__ = ()
     viewer = wrapped_property("viewer", EventActionMap)
@@ -196,6 +219,7 @@ class InputEventBindings(JsonObjectWrapper):
     data_view = dataView = wrapped_property("dataView", EventActionMap)
 
 
+@export
 class PrefetchState(JsonObjectWrapper):
     __slots__ = ()
     supports_validation = True
@@ -203,6 +227,7 @@ class PrefetchState(JsonObjectWrapper):
     state = wrapped_property("state", viewer_state.ViewerState)
 
 
+@export
 class ScaleBarOptions(JsonObjectWrapper):
     __slots__ = ()
     supports_validation = True
@@ -216,9 +241,7 @@ class ScaleBarOptions(JsonObjectWrapper):
     bar_top_margin_in_pixels = barTopMarginInPixels = wrapped_property(
         "barTopMarginInPixels", optional(float, 5)
     )
-    font_name = fontName = wrapped_property(
-        "fontName", optional(text_type, "sans-serif")
-    )
+    font_name = fontName = wrapped_property("fontName", optional(str, "sans-serif"))
     padding_in_pixels = paddingInPixels = wrapped_property(
         "paddingInPixels", optional(float, 2)
     )
@@ -236,6 +259,7 @@ class ScaleBarOptions(JsonObjectWrapper):
     )
 
 
+@export
 class VolumeInfo(JsonObjectWrapper):
     __slots__ = ()
 
@@ -252,6 +276,7 @@ class VolumeInfo(JsonObjectWrapper):
         return self.dimensions.rank
 
 
+@export
 class VolumeRequest(JsonObjectWrapper):
     __slots__ = ()
     id = wrapped_property("id", str)
@@ -264,23 +289,25 @@ class VolumeRequest(JsonObjectWrapper):
     )
 
 
+@export
 class ConfigState(JsonObjectWrapper):
     __slots__ = ()
-    credentials = wrapped_property("credentials", typed_string_map(dict))
-    actions = wrapped_property("actions", typed_set(text_type))
+    credentials = wrapped_property("credentials", typed_map(str, dict))
+    actions = wrapped_property("actions", typed_set(str))
     input_event_bindings = inputEventBindings = wrapped_property(
         "inputEventBindings", InputEventBindings
     )
     status_messages = statusMessages = wrapped_property(
-        "statusMessages", typed_string_map(text_type)
+        "statusMessages", typed_map(str, str)
     )
     source_generations = sourceGenerations = wrapped_property(
-        "sourceGenerations", typed_string_map(int)
+        "sourceGenerations", typed_map(str, int)
     )
-    screenshot = wrapped_property("screenshot", optional(text_type))
+    screenshot = wrapped_property("screenshot", optional(str))
     show_ui_controls = showUIControls = wrapped_property(
         "showUIControls", optional(bool, True)
     )
+    show_top_bar = showTopBar = wrapped_property("showTopBar", optional(bool, True))
     show_location = showLocation = wrapped_property(
         "showLocation", optional(bool, True)
     )
@@ -296,6 +323,12 @@ class ConfigState(JsonObjectWrapper):
     show_layer_side_panel_button = showLayerSidePanelButton = wrapped_property(
         "showLayerSidePanelButton", optional(bool, True)
     )
+    show_screenshot_button = showScreenshotButton = wrapped_property(
+        "showScreenshotButton", optional(bool, True)
+    )
+    show_tool_palette_button = showToolPaletteButton = wrapped_property(
+        "showToolPaletteButton", optional(bool, True)
+    )
     show_layer_list_panel_button = showLayerListPanelButton = wrapped_property(
         "showLayerListPanelButton", optional(bool, True)
     )
@@ -305,6 +338,10 @@ class ConfigState(JsonObjectWrapper):
     show_panel_borders = showPanelBorders = wrapped_property(
         "showPanelBorders", optional(bool, True)
     )
+    show_all_dimension_plot_bounds = showAllDimensionPlotBounds = wrapped_property(
+        "showAllDimensionPlotBounds", optional(bool, True)
+    )
+    pick_radius = pickRadius = wrapped_property("pickRadius", optional(int, 5))
     scale_bar_options = scaleBarOptions = wrapped_property(
         "scaleBarOptions", ScaleBarOptions
     )
@@ -318,8 +355,3 @@ class ConfigState(JsonObjectWrapper):
     volume_requests = volumeRequests = wrapped_property(
         "volumeRequests", typed_list(VolumeRequest)
     )
-
-
-class PrivateState(JsonObjectWrapper):
-    __slots__ = ()
-    credentials = wrapped_property("credentials", typed_string_map(optional(int)))

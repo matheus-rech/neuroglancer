@@ -34,7 +34,7 @@ import {
 } from "#src/util/color.js";
 import { DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
-import { kZeroVec4, vec3, vec4 } from "#src/util/geom.js";
+import { vec3, vec4 } from "#src/util/geom.js";
 import {
   parseArray,
   parseFixedLengthArray,
@@ -46,7 +46,6 @@ import {
 } from "#src/util/json.js";
 import type { DataTypeInterval } from "#src/util/lerp.js";
 import {
-  computeLerp,
   convertDataTypeInterval,
   dataTypeIntervalToJson,
   defaultDataTypeRange,
@@ -58,7 +57,6 @@ import {
 } from "#src/util/lerp.js";
 import { NullarySignal } from "#src/util/signal.js";
 import type { Trackable } from "#src/util/trackable.js";
-import type { Uint64 } from "#src/util/uint64.js";
 import type { GL } from "#src/webgl/context.js";
 import type { HistogramChannelSpecification } from "#src/webgl/empirical_cdf.js";
 import { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
@@ -602,7 +600,6 @@ function parseTransferFunctionDirective(
     [],
     dataType !== undefined ? dataType : DataType.FLOAT32,
   );
-  let specifedPoints = false;
   if (valueType !== "transferFunction") {
     errors.push("type must be transferFunction");
   }
@@ -629,7 +626,6 @@ function parseTransferFunctionDirective(
           break;
         }
         case "controlPoints": {
-          specifedPoints = true;
           if (dataType !== undefined) {
             sortedControlPoints = parseTransferFunctionControlPoints(
               value,
@@ -649,19 +645,6 @@ function parseTransferFunctionDirective(
 
   if (window === undefined) {
     window = sortedControlPoints.range;
-  }
-  // Set a simple black to white transfer function if no control points are specified.
-  if (
-    sortedControlPoints.length === 0 &&
-    !specifedPoints &&
-    dataType !== undefined
-  ) {
-    const startPoint = computeLerp(window, dataType, 0.4) as number;
-    const endPoint = computeLerp(window, dataType, 0.7) as number;
-    sortedControlPoints.addPoint(new ControlPoint(startPoint, kZeroVec4));
-    sortedControlPoints.addPoint(
-      new ControlPoint(endPoint, vec4.fromValues(255, 255, 255, 255)),
-    );
   }
   if (errors.length > 0) {
     return { errors };
@@ -848,15 +831,10 @@ float ${uName}() {
   }
 }
 
-function objectFromEntries(entries: Iterable<[string, any]>) {
-  const obj: any = {};
-  for (const [key, value] of entries) {
-    obj[key] = value;
+function replaceBigintAndMap(_key: string, value: unknown) {
+  if (typeof value === "bigint") {
+    return value.toString();
   }
-  return obj;
-}
-
-function replaceMap(_key: string, value: unknown) {
   if (value instanceof Map) {
     return Array.from(value.entries());
   }
@@ -865,7 +843,7 @@ function replaceMap(_key: string, value: unknown) {
 
 function encodeControls(controls: Controls | undefined) {
   if (controls === undefined) return undefined;
-  return JSON.stringify(objectFromEntries(controls), replaceMap);
+  return JSON.stringify(Object.fromEntries(controls), replaceBigintAndMap);
 }
 
 export class WatchableShaderUiControls
@@ -888,6 +866,7 @@ export class WatchableShaderUiControls
 export interface InvlerpParameters {
   range: DataTypeInterval;
   window: DataTypeInterval;
+  autoCompute?: boolean;
 }
 
 export interface ImageInvlerpParameters extends InvlerpParameters {
@@ -1160,9 +1139,9 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
   }
 
   controlPointsToJson(controlPoints: ControlPoint[], dataType: DataType) {
-    function inputToJson(inputValue: number | Uint64) {
+    function inputToJson(inputValue: number | bigint) {
       if (dataType === DataType.UINT64) {
-        return (inputValue as Uint64).toJSON();
+        return inputValue.toString();
       }
       return inputValue;
     }
@@ -1418,7 +1397,11 @@ export class ShaderControlState
       (state) => {
         const channels: HistogramChannelSpecification[] = [];
         for (const { control, trackable } of state.values()) {
-          if (control.type !== "imageInvlerp") continue;
+          if (
+            control.type !== "imageInvlerp" &&
+            control.type !== "transferFunction"
+          )
+            continue;
           channels.push({ channel: trackable.value.channel });
         }
         return channels;
@@ -1444,7 +1427,10 @@ export class ShaderControlState
     const histogramBounds = makeCachedLazyDerivedWatchableValue((state) => {
       const bounds: DataTypeInterval[] = [];
       for (const { control, trackable } of state.values()) {
-        if (control.type === "imageInvlerp") {
+        if (
+          control.type === "imageInvlerp" ||
+          control.type === "transferFunction"
+        ) {
           bounds.push(trackable.value.window);
         } else if (control.type === "propertyInvlerp") {
           const { dataType, range, window } =

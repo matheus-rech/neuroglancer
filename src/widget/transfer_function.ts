@@ -31,6 +31,7 @@ import {
 } from "#src/util/array.js";
 import { DATA_TYPE_SIGNED, DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
+import { expandRange } from "#src/util/empirical_cdf.js";
 import {
   EventActionMap,
   registerActionListener,
@@ -40,16 +41,18 @@ import type { DataTypeInterval } from "#src/util/lerp.js";
 import {
   computeInvlerp,
   computeLerp,
+  dataTypeIntervalEqual,
   defaultDataTypeRange,
+  getIntervalBoundsEffectiveFraction,
   parseDataTypeValue,
 } from "#src/util/lerp.js";
 import { MouseEventBinder } from "#src/util/mouse_bindings.js";
 import { startRelativeMouseDrag } from "#src/util/mouse_drag.js";
-import type { Uint64 } from "#src/util/uint64.js";
+import { getWheelZoomAmount } from "#src/util/wheel_zoom.js";
 import type { WatchableVisibilityPriority } from "#src/visibility_priority/frontend.js";
-import type { Buffer } from "#src/webgl/buffer.js";
-import { getMemoizedBuffer } from "#src/webgl/buffer.js";
+import { GLBuffer, getMemoizedBuffer } from "#src/webgl/buffer.js";
 import type { GL } from "#src/webgl/context.js";
+import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
 import {
   defineInvlerpShaderFunction,
   enableLerpShaderFunction,
@@ -71,7 +74,10 @@ import {
   getUpdatedRangeAndWindowParameters,
   updateInputBoundValue,
   updateInputBoundWidth,
+  createCDFLineShader,
+  NUM_CDF_LINES,
 } from "#src/widget/invlerp.js";
+import { AutoRangeFinder } from "#src/widget/invlerp_range_finder.js";
 import type {
   LayerControlFactory,
   LayerControlTool,
@@ -88,6 +94,7 @@ const TRANSFER_FUNCTION_BORDER_WIDTH = 0.05;
 const transferFunctionSamplerTextureUnit = Symbol(
   "transferFunctionSamplerTexture",
 );
+const histogramSamplerTextureUnit = Symbol("histogramSamplerTexture");
 
 const defaultTransferFunctionSizes: Record<DataType, number> = {
   [DataType.UINT8]: 256,
@@ -147,7 +154,7 @@ interface CanvasPosition {
  */
 export class ControlPoint {
   constructor(
-    public inputValue: number | Uint64,
+    public inputValue: number | bigint,
     public outputColor: vec4 = kZeroVec4,
   ) {}
 
@@ -190,12 +197,22 @@ export class SortedControlPoints {
     public dataType: DataType,
     private autoComputeRange: boolean = true,
   ) {
-    this.controlPoints = controlPoints;
     this.range = defaultDataTypeRange[dataType];
     this.sortAndComputeRange();
   }
   get length() {
     return this.controlPoints.length;
+  }
+  setDefaultControlPoints(
+    controlPointRange: DataTypeInterval,
+    finalColor: vec4,
+  ) {
+    this.clear();
+    this.addPoint(new ControlPoint(controlPointRange[0], kZeroVec4));
+    this.addPoint(new ControlPoint(controlPointRange[1], finalColor));
+  }
+  clear() {
+    this.controlPoints = [];
   }
   addPoint(controlPoint: ControlPoint) {
     const { inputValue, outputColor } = controlPoint;
@@ -239,7 +256,7 @@ export class SortedControlPoints {
     }
     this.controlPoints[index].outputColor = outputColor;
   }
-  findNearestControlPointIndex(inputValue: number | Uint64) {
+  findNearestControlPointIndex(inputValue: number | bigint) {
     const controlPoint = new ControlPoint(inputValue);
     const valueToFind = controlPoint.normalizedInput(this.range);
     return this.findNearestControlPointIndexByNormalizedInput(valueToFind);
@@ -393,6 +410,7 @@ export class LookupTable {
  */
 export class TransferFunction extends RefCounted {
   lookupTable: LookupTable;
+  autoPointUpdateEnabled: boolean = true;
   constructor(
     public dataType: DataType,
     public trackable: WatchableValueInterface<TransferFunctionParameters>,
@@ -416,6 +434,55 @@ export class TransferFunction extends RefCounted {
   }
   addPoint(controlPoint: ControlPoint) {
     this.sortedControlPoints.addPoint(controlPoint);
+  }
+  /**
+   * Generate two default control points for the transfer function, from transparent to a full color.
+   * @param range The range of the two control points to interpolate between.
+   * If null, the data window will be used to generate the control points.
+   * @param window The window of the data in view. Control points are placed
+   * at 30% and 70% of the window if range is not provided.
+   * If the window is not provided, the current window of the transfer function
+   * will be used.
+   */
+  generateDefaultControlPoints(
+    range: DataTypeInterval | null = null,
+    window: DataTypeInterval | undefined = undefined,
+  ) {
+    if (!this.autoPointUpdateEnabled) {
+      return;
+    }
+    window = window !== undefined ? window : this.trackable.value.window;
+    const controlPointRange =
+      range !== null
+        ? range
+        : ([
+            computeLerp(window, this.dataType, 0.3),
+            computeLerp(window, this.dataType, 0.7),
+          ] as DataTypeInterval);
+    // If the range ends up being equal, instead just use the window
+    if (controlPointRange[0] === controlPointRange[1]) {
+      controlPointRange[0] = window[0];
+      controlPointRange[1] = window[1];
+    }
+    const color = this.trackable.value.defaultColor;
+    const colorOpacity = vec4.fromValues(
+      Math.round(color[0] * 255),
+      Math.round(color[1] * 255),
+      Math.round(color[2] * 255),
+      255,
+    );
+    this.sortedControlPoints.setDefaultControlPoints(
+      controlPointRange,
+      colorOpacity,
+    );
+  }
+  generateDefaultWindow(range: DataTypeInterval | null = null) {
+    const actualRange = range !== null ? range : this.sortedControlPoints.range;
+    const window = expandRange(actualRange, this.dataType);
+    this.trackable.value = {
+      ...this.trackable.value,
+      window,
+    };
   }
   updatePoint(index: number, controlPoint: ControlPoint): number {
     return this.sortedControlPoints.updatePoint(index, controlPoint);
@@ -524,7 +591,7 @@ abstract class BaseLookupTexture extends RefCounted {
  */
 class DirectLookupTableTexture extends BaseLookupTexture {
   texture: WebGLTexture | null = null;
-  protected priorOptions: LookupTableTextureOptions | undefined = undefined;
+  declare protected priorOptions: LookupTableTextureOptions | undefined;
 
   constructor(public gl: GL | null) {
     super(gl);
@@ -553,7 +620,7 @@ class DirectLookupTableTexture extends BaseLookupTexture {
 }
 
 export class ControlPointTexture extends BaseLookupTexture {
-  protected priorOptions: ControlPointTextureOptions | undefined;
+  declare protected priorOptions: ControlPointTextureOptions | undefined;
   constructor(public gl: GL | null) {
     super(gl);
   }
@@ -596,75 +663,95 @@ export class ControlPointTexture extends BaseLookupTexture {
   }
 }
 
+function getDataValuesArray() {
+  const array = new Uint8Array(NUM_CDF_LINES * VERTICES_PER_LINE);
+  for (let i = 0; i < NUM_CDF_LINES; ++i) {
+    for (let j = 0; j < VERTICES_PER_LINE; ++j) {
+      array[i * VERTICES_PER_LINE + j] = i;
+    }
+  }
+  return array;
+}
+
+function getTextureVertexBufferArray() {
+  return createGriddedRectangleArray(TRANSFER_FUNCTION_PANEL_SIZE);
+}
+
 /**
  * Display the UI canvas for the transfer function widget and
  * handle shader updates for elements of the canvas
  */
 class TransferFunctionPanel extends IndirectRenderedPanel {
   texture: DirectLookupTableTexture;
-  private textureVertexBuffer: Buffer;
-  private textureVertexBufferArray: Float32Array;
-  private controlPointsVertexBuffer: Buffer;
+  private textureVertexBuffer: GLBuffer;
+  private controlPointsVertexBuffer: GLBuffer;
   private controlPointsPositionArray = new Float32Array();
-  private controlPointsColorBuffer: Buffer;
+  private controlPointsColorBuffer: GLBuffer;
   private controlPointsColorArray = new Float32Array();
-  private linePositionBuffer: Buffer;
+  private linePositionBuffer: GLBuffer;
   private linePositionArray = new Float32Array();
   get drawOrder() {
     return 1;
   }
-  transferFunction = this.registerDisposer(
-    new TransferFunction(
-      this.parent.dataType,
-      this.parent.trackable,
-      TRANSFER_FUNCTION_PANEL_SIZE,
-    ),
-  );
-  controller = this.registerDisposer(
-    new TransferFunctionController(
-      this.element,
-      this.parent.dataType,
-      this.transferFunction,
-      () => this.parent.trackable.value,
-      (value: TransferFunctionParameters) => {
-        this.parent.trackable.value = value;
-      },
-    ),
-  );
+  transferFunction: TransferFunction;
+  controller: TransferFunctionController;
+  private dataValuesBuffer;
+
   constructor(public parent: TransferFunctionWidget) {
     super(parent.display, document.createElement("div"), parent.visibility);
     const { element, gl } = this;
-    element.classList.add("neuroglancer-transfer-function-panel");
-    this.textureVertexBufferArray = createGriddedRectangleArray(
-      TRANSFER_FUNCTION_PANEL_SIZE,
-    );
-    this.texture = this.registerDisposer(new DirectLookupTableTexture(gl));
 
-    function createBuffer(dataArray: Float32Array) {
-      return getMemoizedBuffer(
+    this.transferFunction = this.registerDisposer(
+      new TransferFunction(
+        parent.dataType,
+        parent.trackable,
+        TRANSFER_FUNCTION_PANEL_SIZE,
+      ),
+    );
+    this.controller = this.registerDisposer(
+      new TransferFunctionController(
+        element,
+        parent.dataType,
+        this.transferFunction,
+        () => parent.trackable.value,
+        (value: TransferFunctionParameters) => {
+          parent.trackable.value = value;
+        },
+      ),
+    );
+    this.dataValuesBuffer = this.registerDisposer(
+      getMemoizedBuffer(
         gl,
         WebGL2RenderingContext.ARRAY_BUFFER,
-        () => dataArray,
-      ).value;
-    }
+        getDataValuesArray,
+      ),
+    ).value;
+
+    element.classList.add("neuroglancer-transfer-function-panel");
+    this.texture = this.registerDisposer(new DirectLookupTableTexture(gl));
+
     this.textureVertexBuffer = this.registerDisposer(
-      createBuffer(this.textureVertexBufferArray),
-    );
+      getMemoizedBuffer(
+        gl,
+        WebGL2RenderingContext.ARRAY_BUFFER,
+        getTextureVertexBufferArray,
+      ),
+    ).value;
     this.controlPointsVertexBuffer = this.registerDisposer(
-      createBuffer(this.controlPointsPositionArray),
+      new GLBuffer(gl, WebGL2RenderingContext.ARRAY_BUFFER),
     );
     this.controlPointsColorBuffer = this.registerDisposer(
-      createBuffer(this.controlPointsColorArray),
+      new GLBuffer(gl, WebGL2RenderingContext.ARRAY_BUFFER),
     );
     this.linePositionBuffer = this.registerDisposer(
-      createBuffer(this.linePositionArray),
+      new GLBuffer(gl, WebGL2RenderingContext.ARRAY_BUFFER),
     );
   }
 
   updateTransferFunctionPointsAndLines() {
     // Normalize position to [-1, 1] for shader (x axis)
     const window = this.parent.trackable.value.window;
-    function normalizeInput(input: number | Uint64) {
+    function normalizeInput(input: number | bigint) {
       const lerpedInput = computeInvlerp(window, input);
       return lerpedInput * 2 - 1;
     }
@@ -963,6 +1050,10 @@ class TransferFunctionPanel extends IndirectRenderedPanel {
     }
   }
 
+  private histogramLineShader = this.registerDisposer(
+    (() => createCDFLineShader(this.gl, histogramSamplerTextureUnit))(),
+  );
+
   private transferFunctionLineShader = this.registerDisposer(
     (() => {
       const builder = new ShaderBuilder(this.gl);
@@ -976,7 +1067,7 @@ vec4 end = vec4(aLineStartEnd[2], aLineStartEnd[3], 0.0, 1.0);
 emitLine(start, end, 1.0);
 `);
       builder.setFragmentMain(`
-out_color = vec4(0.0, 1.0, 1.0, getLineAlpha());
+out_color = vec4(0.35, 0.35, 0.35, getLineAlpha());
 `);
       return builder.build();
     })(),
@@ -1042,6 +1133,7 @@ out_color = tempColor * alpha;
       gl,
       transferFunctionShader,
       controlPointsShader,
+      histogramLineShader: lineShader,
     } = this;
     this.setGLLogicalViewport();
     gl.clearColor(0.0, 0.0, 0.0, 0.0);
@@ -1078,6 +1170,42 @@ out_color = tempColor * alpha;
       gl.disableVertexAttribArray(aVertexPosition);
       gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, null);
     }
+    // Draw CDF lines
+    if (this.parent.histogramSpecifications.producerVisibility.visible) {
+      const { renderViewport } = this;
+      lineShader.bind();
+      initializeLineShader(
+        lineShader,
+        {
+          width: renderViewport.logicalWidth,
+          height: renderViewport.logicalHeight,
+        },
+        /*featherWidthInPixels=*/ 1.0,
+      );
+      const histogramTextureUnit = lineShader.textureUnit(
+        histogramSamplerTextureUnit,
+      );
+      gl.uniform1f(
+        lineShader.uniform("uBoundsFraction"),
+        getIntervalBoundsEffectiveFraction(
+          this.parent.dataType,
+          this.parent.trackable.value.window,
+        ),
+      );
+      gl.activeTexture(WebGL2RenderingContext.TEXTURE0 + histogramTextureUnit);
+      gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, this.parent.texture);
+      setRawTextureParameters(gl);
+      const aDataValue = lineShader.attribute("aDataValue");
+      this.dataValuesBuffer.bindToVertexAttribI(
+        aDataValue,
+        /*componentsPerVertexAttribute=*/ 1,
+        /*attributeType=*/ WebGL2RenderingContext.UNSIGNED_BYTE,
+      );
+      drawLines(gl, /*linesPerInstance=*/ NUM_CDF_LINES, /*numInstances=*/ 1);
+      gl.disableVertexAttribArray(aDataValue);
+      gl.bindTexture(WebGL2RenderingContext.TEXTURE_2D, null);
+    }
+
     // Draw lines and control points on top of transfer function - if there are any
     if (this.controlPointsPositionArray.length > 0) {
       const { renderViewport } = this;
@@ -1136,69 +1264,11 @@ out_color = tempColor * alpha;
   }
 }
 
-/**
- * Create the bounds on the UI window inputs for the transfer function widget
- */
-function createWindowBoundInputs(
-  dataType: DataType,
-  model: WatchableValueInterface<TransferFunctionParameters>,
-) {
-  function createWindowBoundInput(endpoint: number): HTMLInputElement {
-    const e = document.createElement("input");
-    e.addEventListener("focus", () => {
-      e.select();
-    });
-    e.classList.add("neuroglancer-transfer-function-widget-bound");
-    e.type = "text";
-    e.spellcheck = false;
-    e.autocomplete = "off";
-    e.title = `${
-      endpoint === 0 ? "Lower" : "Upper"
-    } window for transfer function`;
-    return e;
-  }
-
-  const container = document.createElement("div");
-  container.classList.add("neuroglancer-transfer-function-window-bounds");
-  const inputs = [createWindowBoundInput(0), createWindowBoundInput(1)];
-  for (let endpointIndex = 0; endpointIndex < 2; ++endpointIndex) {
-    const input = inputs[endpointIndex];
-    input.addEventListener("input", () => {
-      updateInputBoundWidth(input);
-    });
-    input.addEventListener("change", () => {
-      const existingBounds = model.value.window;
-      const intervals = { range: existingBounds, window: existingBounds };
-      try {
-        const value = parseDataTypeValue(dataType, input.value);
-        const window = getUpdatedRangeAndWindowParameters(
-          intervals,
-          "window",
-          endpointIndex,
-          value,
-          /*fitRangeInWindow=*/ true,
-        ).window;
-        if (window[0] === window[1]) {
-          throw new Error("Window bounds cannot be equal");
-        }
-        model.value = { ...model.value, window };
-      } catch {
-        updateInputBoundValue(input, existingBounds[endpointIndex]);
-      }
-    });
-  }
-  container.appendChild(inputs[0]);
-  container.appendChild(inputs[1]);
-  return {
-    container,
-    inputs,
-  };
-}
-
 const inputEventMap = EventActionMap.fromObject({
   "shift?+mousedown0": { action: "add-or-drag-point" },
   "shift+dblclick0": { action: "remove-point" },
   "shift?+mousedown2": { action: "change-point-color" },
+  "shift?+wheel": { action: "zoom-via-wheel" },
 });
 
 /**
@@ -1235,6 +1305,7 @@ class TransferFunctionController extends RefCounted {
         const nearestIndex = this.findControlPointIfNearCursor(mouseEvent);
         if (nearestIndex !== -1) {
           this.transferFunction.removePoint(nearestIndex);
+          this.disableAutoPointUpdate();
           this.updateValue({
             ...this.getModel(),
             sortedControlPoints:
@@ -1257,6 +1328,7 @@ class TransferFunctionController extends RefCounted {
             nearestIndex,
             colorInAbsoluteValue,
           );
+          this.disableAutoPointUpdate();
           this.updateValue({
             ...this.getModel(),
             sortedControlPoints:
@@ -1265,6 +1337,46 @@ class TransferFunctionController extends RefCounted {
         }
       },
     );
+    registerActionListener<WheelEvent>(
+      element,
+      "zoom-via-wheel",
+      (actionEvent) => {
+        const wheelEvent = actionEvent.detail;
+        const zoomAmount = getWheelZoomAmount(wheelEvent);
+        const relativeX = this.getTargetFraction(wheelEvent);
+        const { dataType } = this;
+        const model = this.getModel();
+        const newLower = computeLerp(
+          model.window,
+          dataType,
+          relativeX * (1 - zoomAmount),
+        );
+        const newUpper = computeLerp(
+          model.window,
+          dataType,
+          (1 - relativeX) * zoomAmount + relativeX,
+        );
+        if (newLower !== newUpper) {
+          const newWindow = [newLower, newUpper] as DataTypeInterval;
+          this.transferFunction.generateDefaultControlPoints(null, newWindow);
+          this.updateValue({
+            ...model,
+            sortedControlPoints: this.transferFunction.sortedControlPoints,
+            window: newWindow,
+          });
+        }
+      },
+    );
+  }
+  disableAutoPointUpdate() {
+    this.transferFunction.autoPointUpdateEnabled = false;
+  }
+  /**
+   * Get fraction of distance in x along bounding rect for a MouseEvent.
+   */
+  getTargetFraction(event: MouseEvent) {
+    const clientRect = this.element.getBoundingClientRect();
+    return (event.clientX - clientRect.left) / clientRect.width;
   }
   updateValue(value: TransferFunctionParameters | undefined) {
     if (value === undefined) return;
@@ -1311,6 +1423,7 @@ class TransferFunctionController extends RefCounted {
       color[2],
       normalizedY,
     );
+    this.disableAutoPointUpdate();
     this.transferFunction.addPoint(
       new ControlPoint(
         this.convertPanelSpaceInputToAbsoluteValue(normalizedX),
@@ -1326,21 +1439,33 @@ class TransferFunctionController extends RefCounted {
     };
   }
   moveControlPoint(event: MouseEvent): TransferFunctionParameters | undefined {
-    if (this.currentGrabbedControlPointIndex !== -1) {
+    const { controlPoints } = this.transferFunction.sortedControlPoints;
+    if (
+      this.currentGrabbedControlPointIndex !== -1 &&
+      this.currentGrabbedControlPointIndex < controlPoints.length
+    ) {
       const position = this.getControlPointPosition(event);
       if (position === undefined) return undefined;
       const { normalizedX, normalizedY } = position;
-      const newColor =
-        this.transferFunction.trackable.value.sortedControlPoints.controlPoints[
-          this.currentGrabbedControlPointIndex
-        ].outputColor;
+      const selectedPoint = controlPoints[this.currentGrabbedControlPointIndex];
+      let newInputValue =
+        this.convertPanelSpaceInputToAbsoluteValue(normalizedX);
+      // If the input value is the same as another control point keep the input value the same, don't use the new input value
+      for (let i = 0; i < controlPoints.length; i++) {
+        if (
+          controlPoints[i].inputValue === newInputValue &&
+          i !== this.currentGrabbedControlPointIndex
+        ) {
+          newInputValue = selectedPoint.inputValue;
+        }
+      }
+
+      const newColor = vec4.clone(selectedPoint.outputColor);
       newColor[3] = Math.round(normalizedY * 255);
+      this.disableAutoPointUpdate();
       this.currentGrabbedControlPointIndex = this.transferFunction.updatePoint(
         this.currentGrabbedControlPointIndex,
-        new ControlPoint(
-          this.convertPanelSpaceInputToAbsoluteValue(normalizedX),
-          newColor,
-        ),
+        new ControlPoint(newInputValue, newColor),
       );
       return {
         ...this.getModel(),
@@ -1382,10 +1507,11 @@ class TransferFunctionController extends RefCounted {
    * distance in the Y direction is returned.
    */
   findControlPointIfNearCursor(event: MouseEvent) {
-    const { transferFunction } = this;
+    const { transferFunction, dataType } = this;
     const { window } = transferFunction.trackable.value;
     const numControlPoints =
       transferFunction.sortedControlPoints.controlPoints.length;
+
     function convertControlPointInputToPanelSpace(controlPointIndex: number) {
       if (controlPointIndex < 0 || controlPointIndex >= numControlPoints) {
         return null;
@@ -1396,6 +1522,7 @@ class TransferFunctionController extends RefCounted {
           .inputValue,
       );
     }
+
     function convertControlPointOpacityToPanelSpace(controlPointIndex: number) {
       if (controlPointIndex < 0 || controlPointIndex >= numControlPoints) {
         return null;
@@ -1405,6 +1532,48 @@ class TransferFunctionController extends RefCounted {
           .outputColor[3] / 255
       );
     }
+
+    function calculateControlPointGrabDistance() {
+      let windowSize = 0.0;
+      if (dataType == DataType.UINT64) {
+        windowSize = Number((window[1] as bigint) - (window[0] as bigint));
+      } else if (dataType == DataType.FLOAT32) {
+        // Floating point data can have very small windows with many points
+        windowSize = 1.0 / CONTROL_POINT_X_GRAB_DISTANCE;
+      } else {
+        windowSize = (window[1] as number) - (window[0] as number);
+      }
+      const controlPointGrabDistance = Math.max(
+        CONTROL_POINT_X_GRAB_DISTANCE,
+        1.0 / windowSize,
+      );
+      return controlPointGrabDistance;
+    }
+
+    function findBestMatchingControlPoint(controlPointGrabDistance: number) {
+      const possibleMatches: [number, number][] = [];
+      const totalControlPoints = transferFunction.sortedControlPoints.length;
+      for (let i = 0; i < totalControlPoints; i++) {
+        const currentPosition = convertControlPointInputToPanelSpace(i);
+        const currentDistance =
+          currentPosition !== null
+            ? Math.abs(currentPosition - mouseXPosition)
+            : Infinity;
+        if (currentDistance <= controlPointGrabDistance) {
+          const currentOpacity = convertControlPointOpacityToPanelSpace(i);
+          possibleMatches.push([
+            i,
+            Math.abs(currentOpacity! - mouseYPosition) + 10 * currentDistance,
+          ]);
+        }
+      }
+      const bestMatch =
+        possibleMatches.length === 0
+          ? nearestControlPointIndex
+          : possibleMatches.sort((a, b) => a[1] - b[1])[0][0];
+      return bestMatch;
+    }
+
     const position = this.getControlPointPosition(event);
     if (position === undefined) return -1;
     const mouseXPosition = position.normalizedX;
@@ -1416,59 +1585,15 @@ class TransferFunctionController extends RefCounted {
     }
     const nearestControlPointPanelPosition =
       convertControlPointInputToPanelSpace(nearestControlPointIndex)!;
+    const controlPointGrabDistance = calculateControlPointGrabDistance();
     if (
       Math.abs(mouseXPosition - nearestControlPointPanelPosition) >
-      CONTROL_POINT_X_GRAB_DISTANCE
+      controlPointGrabDistance
     ) {
       return -1;
     }
-    // If points are nearby in X space, use Y space to break ties
-    const possibleMatches: [number, number][] = [
-      [
-        nearestControlPointIndex,
-        Math.abs(
-          convertControlPointOpacityToPanelSpace(nearestControlPointIndex)! -
-            mouseYPosition,
-        ),
-      ],
-    ];
-    const nextPosition = convertControlPointInputToPanelSpace(
-      nearestControlPointIndex + 1,
-    );
-    const nextDistance =
-      nextPosition !== null
-        ? Math.abs(nextPosition - mouseXPosition)
-        : Infinity;
-    if (nextDistance <= CONTROL_POINT_X_GRAB_DISTANCE) {
-      possibleMatches.push([
-        nearestControlPointIndex + 1,
-        Math.abs(
-          convertControlPointOpacityToPanelSpace(
-            nearestControlPointIndex + 1,
-          )! - mouseYPosition,
-        ),
-      ]);
-    }
-
-    const previousPosition = convertControlPointInputToPanelSpace(
-      nearestControlPointIndex - 1,
-    );
-    const previousDistance =
-      previousPosition !== null
-        ? Math.abs(previousPosition - mouseXPosition)
-        : Infinity;
-    if (previousDistance <= CONTROL_POINT_X_GRAB_DISTANCE) {
-      possibleMatches.push([
-        nearestControlPointIndex - 1,
-        Math.abs(
-          convertControlPointOpacityToPanelSpace(
-            nearestControlPointIndex - 1,
-          )! - mouseYPosition,
-        ),
-      ]);
-    }
-    const bestMatch = possibleMatches.sort((a, b) => a[1] - b[1])[0][0];
-    return bestMatch;
+    // If points are nearby in X space, use mouse distance in both X and Y to determine the best match
+    return findBestMatchingControlPoint(controlPointGrabDistance);
   }
 }
 
@@ -1476,18 +1601,38 @@ class TransferFunctionController extends RefCounted {
  * Widget for the transfer function. Creates the UI elements required for the transfer function.
  */
 class TransferFunctionWidget extends Tab {
-  private transferFunctionPanel = this.registerDisposer(
-    new TransferFunctionPanel(this),
-  );
+  private transferFunctionPanel;
+  autoRangeFinder: AutoRangeFinder;
+  window = this.createWindowBoundInputs();
 
-  window = createWindowBoundInputs(this.dataType, this.trackable);
+  get autoPointUpdateEnabled() {
+    return this.transferFunctionPanel.transferFunction.autoPointUpdateEnabled;
+  }
+
+  set autoPointUpdateEnabled(value: boolean) {
+    this.transferFunctionPanel.transferFunction.autoPointUpdateEnabled = value;
+  }
+
+  get texture() {
+    return this.histogramSpecifications.getFramebuffers(this.display.gl)[
+      this.histogramIndex
+    ].colorBuffers[0].texture;
+  }
   constructor(
     visibility: WatchableVisibilityPriority,
     public display: DisplayContext,
     public dataType: DataType,
     public trackable: WatchableValueInterface<TransferFunctionParameters>,
+    public histogramSpecifications: HistogramSpecifications,
+    public histogramIndex: number,
   ) {
     super(visibility);
+    this.transferFunctionPanel = this.registerDisposer(
+      new TransferFunctionPanel(this),
+    );
+    this.registerDisposer(
+      histogramSpecifications.visibility.add(this.visibility),
+    );
     const { element } = this;
     element.classList.add("neuroglancer-transfer-function-widget");
     element.appendChild(this.transferFunctionPanel.element);
@@ -1496,9 +1641,61 @@ class TransferFunctionWidget extends Tab {
     element.appendChild(this.window.container);
     this.window.container.dispatchEvent(new Event("change"));
 
-    // Color picker element
+    // Container that sits at the bottom of the transfer function widget
+    this.autoRangeFinder = this.registerDisposer(new AutoRangeFinder(this));
+    this.autoRangeFinder.element.appendChild(this.createClearButton());
+    this.autoRangeFinder.element.appendChild(this.createColorPicker(trackable));
+
+    // If no points and no window, set the default control points for the transfer function
+    const currentWindow = this.trackable.value.window;
+    const defaultWindow = defaultDataTypeRange[this.dataType];
+    const windowUnset = dataTypeIntervalEqual(currentWindow, defaultWindow);
+    if (this.trackable.value.sortedControlPoints.length === 0 && windowUnset) {
+      this.autoRangeFinder.autoComputeRange(0, 1);
+    }
+    // Otherwise, mark that points should not auto update unless points are cleared
+    else {
+      this.autoPointUpdateEnabled = false;
+      if (this.trackable.value.sortedControlPoints.length > 0 && windowUnset) {
+        this.transferFunctionPanel.transferFunction.generateDefaultWindow();
+      }
+    }
+
+    this.updateControlPointsAndDraw();
+    this.registerDisposer(
+      this.trackable.changed.add(() => {
+        this.updateControlPointsAndDraw();
+      }),
+    );
+    this.registerDisposer(
+      this.display.updateFinished.add(() => {
+        this.autoRangeFinder.maybeAutoComputeRange();
+      }),
+    );
+    this.registerDisposer(
+      this.autoRangeFinder.finished.add(() => {
+        this.generateDefaultControlPoints(this.autoRangeFinder.computedRange);
+      }),
+    );
+  }
+  private createClearButton() {
+    const clearButton = document.createElement("button");
+    clearButton.classList.add("neuroglancer-transfer-function-clear-button");
+    clearButton.textContent = "Clear";
+    clearButton.title = "Clear all control points";
+    clearButton.addEventListener("click", () => {
+      this.clearPoints();
+    });
+    return clearButton;
+  }
+
+  private createColorPicker(
+    trackable: WatchableValueInterface<TransferFunctionParameters>,
+  ) {
     const colorPickerDiv = document.createElement("div");
-    colorPickerDiv.classList.add("neuroglancer-transfer-function-color-picker");
+    colorPickerDiv.classList.add(
+      "neuroglancer-transfer-function-color-picker-container",
+    );
     const colorPicker = this.registerDisposer(
       new ColorWidget(
         makeCachedDerivedWatchableValue(
@@ -1508,8 +1705,10 @@ class TransferFunctionWidget extends Tab {
         () => vec3.fromValues(1, 1, 1),
       ),
     );
-    colorPicker.element.title = "Transfer Function Color Picker";
-    colorPicker.element.id = "neuroglancer-tf-color-widget";
+    colorPicker.element.classList.add(
+      "neuroglancer-transfer-function-color-picker",
+    );
+    colorPicker.element.title = "Transfer function color picker";
     colorPicker.element.addEventListener("change", () => {
       trackable.value = {
         ...this.trackable.value,
@@ -1523,29 +1722,101 @@ class TransferFunctionWidget extends Tab {
       };
     });
     colorPickerDiv.appendChild(colorPicker.element);
-
-    element.appendChild(colorPickerDiv);
-    this.updateControlPointsAndDraw();
-    this.registerDisposer(
-      this.trackable.changed.add(() => {
-        this.updateControlPointsAndDraw();
-      }),
-    );
-    updateInputBoundValue(
-      this.window.inputs[0],
-      this.trackable.value.window[0],
-    );
-    updateInputBoundValue(
-      this.window.inputs[1],
-      this.trackable.value.window[1],
-    );
+    return colorPickerDiv;
   }
+
+  private createWindowBoundInputs() {
+    const dataType = this.dataType;
+    const model = this.trackable;
+    function createWindowBoundInput(endpoint: number): HTMLInputElement {
+      const e = document.createElement("input");
+      e.addEventListener("focus", () => {
+        e.select();
+      });
+      e.classList.add("neuroglancer-transfer-function-widget-bound");
+      e.type = "text";
+      e.spellcheck = false;
+      e.autocomplete = "off";
+      e.title = `${
+        endpoint === 0 ? "Lower" : "Upper"
+      } window for transfer function`;
+      return e;
+    }
+
+    const container = document.createElement("div");
+    container.classList.add("neuroglancer-transfer-function-window-bounds");
+    const inputs = [createWindowBoundInput(0), createWindowBoundInput(1)];
+    for (let endpointIndex = 0; endpointIndex < 2; ++endpointIndex) {
+      const input = inputs[endpointIndex];
+      input.addEventListener("input", () => {
+        updateInputBoundWidth(input);
+      });
+      input.addEventListener("change", () => {
+        const existingBounds = model.value.window;
+        const intervals = { range: existingBounds, window: existingBounds };
+        try {
+          const value = parseDataTypeValue(dataType, input.value);
+          const window = getUpdatedRangeAndWindowParameters(
+            intervals,
+            "window",
+            endpointIndex,
+            value,
+            /*fitRangeInWindow=*/ true,
+          ).window;
+          if (window[0] === window[1]) {
+            throw new Error("Window bounds cannot be equal");
+          }
+          this.transferFunctionPanel.transferFunction.generateDefaultControlPoints(
+            null,
+            window,
+          );
+          model.value = { ...model.value, window };
+        } catch {
+          updateInputBoundValue(input, existingBounds[endpointIndex]);
+        }
+      });
+    }
+    container.appendChild(inputs[0]);
+    container.appendChild(inputs[1]);
+    return {
+      container,
+      inputs,
+    };
+  }
+
   updateView() {
+    for (let i = 0; i < 2; ++i) {
+      updateInputBoundValue(
+        this.window.inputs[i],
+        this.trackable.value.window[i],
+      );
+    }
     this.transferFunctionPanel.scheduleRedraw();
   }
   updateControlPointsAndDraw() {
     this.transferFunctionPanel.update();
     this.updateView();
+  }
+  updateTrackable(value: TransferFunctionParameters) {
+    this.trackable.value = value;
+  }
+  generateDefaultControlPoints(range: DataTypeInterval | null = null) {
+    const transferFunction = this.transferFunctionPanel.transferFunction;
+    transferFunction.generateDefaultControlPoints(range);
+    this.updateTrackable({
+      ...this.trackable.value,
+      sortedControlPoints: transferFunction.sortedControlPoints,
+    });
+  }
+  clearPoints() {
+    const sortedControlPoints =
+      this.transferFunctionPanel.transferFunction.sortedControlPoints;
+    sortedControlPoints.clear();
+    this.updateTrackable({
+      ...this.trackable.value,
+      sortedControlPoints,
+    });
+    this.autoPointUpdateEnabled = true;
   }
 }
 
@@ -1660,6 +1931,8 @@ export function transferFunctionLayerControl<LayerType extends UserLayer>(
     watchableValue: WatchableValueInterface<TransferFunctionParameters>;
     defaultChannel: number[];
     channelCoordinateSpaceCombiner: CoordinateSpaceCombiner | undefined;
+    histogramSpecifications: HistogramSpecifications;
+    histogramIndex: number;
     dataType: DataType;
   },
 ): LayerControlFactory<LayerType, TransferFunctionWidget> {
@@ -1669,6 +1942,8 @@ export function transferFunctionLayerControl<LayerType extends UserLayer>(
         watchableValue,
         channelCoordinateSpaceCombiner,
         defaultChannel,
+        histogramSpecifications,
+        histogramIndex,
         dataType,
       } = getter(layer);
 
@@ -1681,7 +1956,7 @@ export function transferFunctionLayerControl<LayerType extends UserLayer>(
         const position = context.registerDisposer(
           new Position(channelCoordinateSpaceCombiner.combined),
         );
-        const positiionWidget = context.registerDisposer(
+        const positionWidget = context.registerDisposer(
           new PositionWidget(position, channelCoordinateSpaceCombiner, {
             copyButton: false,
           }),
@@ -1709,7 +1984,7 @@ export function transferFunctionLayerControl<LayerType extends UserLayer>(
         };
         updatePosition();
         context.registerDisposer(watchableValue.changed.add(updatePosition));
-        options.labelContainer.appendChild(positiionWidget.element);
+        options.labelContainer.appendChild(positionWidget.element);
       }
       const control = context.registerDisposer(
         new TransferFunctionWidget(
@@ -1717,6 +1992,8 @@ export function transferFunctionLayerControl<LayerType extends UserLayer>(
           options.display,
           dataType,
           watchableValue,
+          histogramSpecifications,
+          histogramIndex,
         ),
       );
       return { control, controlElement: control.element };

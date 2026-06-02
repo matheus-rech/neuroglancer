@@ -45,10 +45,10 @@ import {
 } from "#src/util/lerp.js";
 import { MouseEventBinder } from "#src/util/mouse_bindings.js";
 import { startRelativeMouseDrag } from "#src/util/mouse_drag.js";
-import { Uint64 } from "#src/util/uint64.js";
 import { getWheelZoomAmount } from "#src/util/wheel_zoom.js";
 import type { WatchableVisibilityPriority } from "#src/visibility_priority/frontend.js";
 import { getMemoizedBuffer } from "#src/webgl/buffer.js";
+import type { GL } from "#src/webgl/context.js";
 import type { ParameterizedEmitterDependentShaderGetter } from "#src/webgl/dynamic_shader.js";
 import { parameterizedEmitterDependentShaderGetter } from "#src/webgl/dynamic_shader.js";
 import type { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
@@ -68,6 +68,7 @@ import type { InvlerpParameters } from "#src/webgl/shader_ui_controls.js";
 import { getSquareCornersBuffer } from "#src/webgl/square_corners_buffer.js";
 import { setRawTextureParameters } from "#src/webgl/texture.js";
 import { makeIcon } from "#src/widget/icon.js";
+import { AutoRangeFinder } from "#src/widget/invlerp_range_finder.js";
 import type { LayerControlTool } from "#src/widget/layer_control.js";
 import type { LegendShaderOptions } from "#src/widget/shader_controls.js";
 import { Tab } from "#src/widget/tab_view.js";
@@ -77,6 +78,55 @@ const inputEventMap = EventActionMap.fromObject({
   "shift?+alt+mousedown0": { action: "adjust-window-via-drag" },
   "shift?+wheel": { action: "zoom-via-wheel" },
 });
+
+export function createCDFLineShader(gl: GL, textureUnit: symbol) {
+  const builder = new ShaderBuilder(gl);
+  defineLineShader(builder);
+  builder.addTextureSampler("sampler2D", "uHistogramSampler", textureUnit);
+  builder.addOutputBuffer("vec4", "out_color", 0);
+  builder.addAttribute("uint", "aDataValue");
+  builder.addUniform("float", "uBoundsFraction");
+  builder.addVertexCode(`
+float getCount(int i) {
+  return texelFetch(uHistogramSampler, ivec2(i, 0), 0).x;
+}
+vec4 getVertex(float cdf, int i) {
+  float x;
+  if (i == 0) {
+    x = -1.0;
+  } else if (i == 255) {
+    x = 1.0;
+  } else {
+    x = float(i) / 254.0 * uBoundsFraction * 2.0 - 1.0;
+  }
+  return vec4(x, cdf * (2.0 - uLineParams.y) - 1.0 + uLineParams.y * 0.5, 0.0, 1.0);
+}
+`);
+  builder.setVertexMain(`
+int lineNumber = int(aDataValue);
+int dataValue = lineNumber;
+float cumSum = 0.0;
+for (int i = 0; i <= dataValue; ++i) {
+  cumSum += getCount(i);
+}
+float total = cumSum + getCount(dataValue + 1);
+float cumSumEnd = dataValue == ${NUM_CDF_LINES - 1} ? cumSum : total;
+if (dataValue == ${NUM_CDF_LINES - 1}) {
+  cumSum + getCount(dataValue + 1);
+}
+for (int i = dataValue + 2; i < 256; ++i) {
+  total += getCount(i);
+}
+total = max(total, 1.0);
+float cdf1 = cumSum / total;
+float cdf2 = cumSumEnd / total;
+emitLine(getVertex(cdf1, lineNumber), getVertex(cdf2, lineNumber + 1), 1.0);
+`);
+  builder.setFragmentMain(`
+out_color = vec4(0.0, 1.0, 1.0, getLineAlpha());
+`);
+  return builder.build();
+}
 
 export class CdfController<
   T extends RangeAndWindowIntervals,
@@ -97,7 +147,7 @@ export class CdfController<
       if (value === undefined) return;
       const clampedRange = getClampedInterval(bounds.window, bounds.range);
       const endpointIndex = getClosestEndpoint(clampedRange, value);
-      const setEndpoint = (value: number | Uint64) => {
+      const setEndpoint = (value: number | bigint) => {
         const bounds = this.getModel();
         this.setModel(
           getUpdatedRangeAndWindowParameters(
@@ -128,7 +178,7 @@ export class CdfController<
         const initialValue = this.getWindowLerp(initialRelativeX);
         // Index for bound being adjusted
         const endpointIndex = initialRelativeX < 0.5 ? 0 : 1;
-        const setEndpoint = (value: number | Uint64) => {
+        const setEndpoint = (value: number | bigint) => {
           const bounds = this.getModel();
           this.setModel(
             getUpdatedRangeAndWindowParameters(
@@ -212,7 +262,7 @@ export class CdfController<
     return computeLerp(this.getModel().window, this.dataType, relativeX);
   }
 
-  getTargetValue(event: MouseEvent): number | Uint64 | undefined {
+  getTargetValue(event: MouseEvent): number | bigint | undefined {
     const targetFraction = this.getTargetFraction(event);
     if (!Number.isFinite(targetFraction)) return undefined;
     return this.getWindowLerp(targetFraction);
@@ -245,7 +295,7 @@ export function getUpdatedRangeAndWindowParameters<
   existingBounds: T,
   boundType: "range" | "window",
   endpointIndex: number,
-  newEndpoint: number | Uint64,
+  newEndpoint: number | bigint,
   fitRangeInWindow = false,
 ): T {
   const newBounds = { ...existingBounds };
@@ -287,7 +337,7 @@ export function getUpdatedRangeAndWindowParameters<
 // 256 bins in total.  The first and last bin are for values below the lower bound/above the upper
 // bound.
 const NUM_HISTOGRAM_BINS_IN_RANGE = 254;
-const NUM_CDF_LINES = NUM_HISTOGRAM_BINS_IN_RANGE + 1;
+export const NUM_CDF_LINES = NUM_HISTOGRAM_BINS_IN_RANGE + 1;
 
 /**
  * Panel that shows Cumulative Distribution Function (CDF) of visible data.
@@ -296,20 +346,21 @@ class CdfPanel extends IndirectRenderedPanel {
   get drawOrder() {
     return 100;
   }
-  controller = this.registerDisposer(
-    new CdfController(
-      this.element,
-      this.parent.dataType,
-      () => this.parent.trackable.value,
-      (value: InvlerpParameters) => {
-        this.parent.trackable.value = value;
-      },
-    ),
-  );
+  controller;
   constructor(public parent: InvlerpWidget) {
     super(parent.display, document.createElement("div"), parent.visibility);
     const { element } = this;
     element.classList.add("neuroglancer-invlerp-cdfpanel");
+    this.controller = this.registerDisposer(
+      new CdfController(
+        element,
+        parent.dataType,
+        () => parent.trackable.value,
+        (value: InvlerpParameters) => {
+          parent.trackable.value = value;
+        },
+      ),
+    );
   }
 
   private dataValuesBuffer = this.registerDisposer(
@@ -325,58 +376,7 @@ class CdfPanel extends IndirectRenderedPanel {
   ).value;
 
   private lineShader = this.registerDisposer(
-    (() => {
-      const builder = new ShaderBuilder(this.gl);
-      defineLineShader(builder);
-      builder.addTextureSampler(
-        "sampler2D",
-        "uHistogramSampler",
-        histogramSamplerTextureUnit,
-      );
-      builder.addOutputBuffer("vec4", "out_color", 0);
-      builder.addAttribute("uint", "aDataValue");
-      builder.addUniform("float", "uBoundsFraction");
-      builder.addVertexCode(`
-float getCount(int i) {
-  return texelFetch(uHistogramSampler, ivec2(i, 0), 0).x;
-}
-vec4 getVertex(float cdf, int i) {
-  float x;
-  if (i == 0) {
-    x = -1.0;
-  } else if (i == 255) {
-    x = 1.0;
-  } else {
-    x = float(i) / 254.0 * uBoundsFraction * 2.0 - 1.0;
-  }
-  return vec4(x, cdf * (2.0 - uLineParams.y) - 1.0 + uLineParams.y * 0.5, 0.0, 1.0);
-}
-`);
-      builder.setVertexMain(`
-int lineNumber = int(aDataValue);
-int dataValue = lineNumber;
-float cumSum = 0.0;
-for (int i = 0; i <= dataValue; ++i) {
-  cumSum += getCount(i);
-}
-float total = cumSum + getCount(dataValue + 1);
-float cumSumEnd = dataValue == ${NUM_CDF_LINES - 1} ? cumSum : total;
-if (dataValue == ${NUM_CDF_LINES - 1}) {
-  cumSum + getCount(dataValue + 1);
-}
-for (int i = dataValue + 2; i < 256; ++i) {
-  total += getCount(i);
-}
-total = max(total, 1.0);
-float cdf1 = cumSum / total;
-float cdf2 = cumSumEnd / total;
-emitLine(getVertex(cdf1, lineNumber), getVertex(cdf2, lineNumber + 1), 1.0);
-`);
-      builder.setFragmentMain(`
-out_color = vec4(0.0, 1.0, 1.0, getLineAlpha());
-`);
-      return builder.build();
-    })(),
+    (() => createCDFLineShader(this.gl, histogramSamplerTextureUnit))(),
   );
 
   private regionCornersBuffer = getSquareCornersBuffer(this.gl, 0, -1, 1, 1);
@@ -666,10 +666,10 @@ export function updateInputBoundWidth(inputElement: HTMLInputElement) {
 
 export function updateInputBoundValue(
   inputElement: HTMLInputElement,
-  bound: number | Uint64,
+  bound: number | bigint,
 ) {
   let boundString: string;
-  if (bound instanceof Uint64 || Number.isInteger(bound)) {
+  if (typeof bound === "bigint" || Number.isInteger(bound)) {
     boundString = bound.toString();
   } else {
     boundString = bound.toPrecision(6);
@@ -729,12 +729,10 @@ export function adjustInvlerpBrightnessContrast(
 }
 
 export class InvlerpWidget extends Tab {
-  cdfPanel = this.registerDisposer(new CdfPanel(this));
-  boundElements = {
-    range: createRangeBoundInputs("range", this.dataType, this.trackable),
-    window: createRangeBoundInputs("window", this.dataType, this.trackable),
-  };
+  cdfPanel;
+  boundElements;
   invertArrows: HTMLElement[];
+  autoRangeFinder: AutoRangeFinder;
   get texture() {
     return this.histogramSpecifications.getFramebuffers(this.display.gl)[
       this.histogramIndex
@@ -753,6 +751,12 @@ export class InvlerpWidget extends Tab {
     public legendShaderOptions: LegendShaderOptions | undefined,
   ) {
     super(visibility);
+    this.cdfPanel = this.registerDisposer(new CdfPanel(this));
+    this.boundElements = {
+      range: createRangeBoundInputs("range", dataType, trackable),
+      window: createRangeBoundInputs("window", dataType, trackable),
+    };
+
     this.registerDisposer(
       histogramSpecifications.visibility.add(this.visibility),
     );
@@ -777,6 +781,7 @@ export class InvlerpWidget extends Tab {
     element.appendChild(this.cdfPanel.element);
     element.classList.add("neuroglancer-invlerp-widget");
     element.appendChild(boundElements.window.container);
+    this.autoRangeFinder = this.registerDisposer(new AutoRangeFinder(this));
     this.updateView();
     this.registerDisposer(
       trackable.changed.add(
@@ -784,6 +789,11 @@ export class InvlerpWidget extends Tab {
           animationFrameDebounce(() => this.updateView()),
         ),
       ),
+    );
+    this.registerDisposer(
+      this.display.updateFinished.add(() => {
+        this.autoRangeFinder.maybeAutoComputeRange();
+      }),
     );
   }
 
@@ -819,6 +829,11 @@ export class InvlerpWidget extends Tab {
     const { invertArrows } = this;
     invertArrows[reversed ? 1 : 0].style.display = "";
     invertArrows[reversed ? 0 : 1].style.display = "none";
+
+    if (this.trackable.value.autoCompute) {
+      this.autoRangeFinder.autoComputeRange(0.01, 0.99);
+      this.trackable.value.autoCompute = false;
+    }
   }
 }
 
@@ -897,7 +912,7 @@ export function activateInvlerpTool(
       const curRange = control.trackable.value.range;
       const curScreenX = newEvent.screenX;
       const curScreenY = newEvent.screenY;
-      if (!dataTypeIntervalEqual(control.dataType, curRange, prevRange)) {
+      if (!dataTypeIntervalEqual(curRange, prevRange)) {
         baseRange = curRange;
         baseScreenX = prevScreenX;
         baseScreenY = prevScreenY;

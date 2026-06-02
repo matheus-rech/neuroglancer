@@ -19,11 +19,12 @@
  */
 
 import "#src/ui/layer_data_sources_tab.css";
-import { LocalDataSource } from "#src/datasource/index.js";
+import { LocalDataSource } from "#src/datasource/local.js";
 import type { UserLayer, UserLayerConstructor } from "#src/layer/index.js";
 import {
   changeLayerName,
   changeLayerType,
+  makeLayer,
   NewUserLayer,
   USER_LAYER_TABS,
 } from "#src/layer/index.js";
@@ -32,6 +33,7 @@ import type {
   LoadedDataSubsource,
 } from "#src/layer/layer_data_source.js";
 import { LoadedLayerDataSource } from "#src/layer/layer_data_source.js";
+import { createImageLayerAsMultiChannel } from "#src/layer/multi_channel_setup.js";
 import { MeshSource, MultiscaleMeshSource } from "#src/mesh/frontend.js";
 import { SkeletonSource } from "#src/skeleton/frontend.js";
 import { MultiscaleVolumeChunkSource } from "#src/sliceview/volume/frontend.js";
@@ -40,7 +42,6 @@ import type { WatchableValueInterface } from "#src/trackable_value.js";
 import { WatchableValue } from "#src/trackable_value.js";
 import type { DebouncedFunction } from "#src/util/animation_frame_debounce.js";
 import { animationFrameDebounce } from "#src/util/animation_frame_debounce.js";
-import type { CancellationToken } from "#src/util/cancellation.js";
 import { DataType } from "#src/util/data_type.js";
 import type { Borrowed } from "#src/util/disposable.js";
 import { RefCounted } from "#src/util/disposable.js";
@@ -51,36 +52,62 @@ import {
 } from "#src/util/dom.js";
 import type { MessageList } from "#src/util/message_list.js";
 import { MessageSeverity } from "#src/util/message_list.js";
+import type { ProgressListener } from "#src/util/progress_listener.js";
 import { makeAddButton } from "#src/widget/add_button.js";
 import { CoordinateSpaceTransformWidget } from "#src/widget/coordinate_transform.js";
+import type {
+  Completer,
+  SyntaxHighlighter,
+} from "#src/widget/multiline_autocomplete.js";
 import {
   AutocompleteTextInput,
   makeCompletionElementWithDescription,
 } from "#src/widget/multiline_autocomplete.js";
+import { ProgressListenerWidget } from "#src/widget/progress_listener.js";
 import { Tab } from "#src/widget/tab_view.js";
+
+const dataSourceUrlSyntaxHighlighter: SyntaxHighlighter = {
+  splitPattern: /\|?[^|:/_]*(?:[:/_]+)?/g,
+  getSeparatorNode: (text: string) => {
+    if (text.startsWith("|") && text.length > 1) {
+      // Create an empty span with CSS class that adds `::after` node with
+      // content "\a". This prevents the linebreak from affecting text selection.
+      const node = document.createElement("span");
+      node.classList.add("neuroglancer-multiline-autocomplete-linebreak");
+      return node;
+    } else {
+      return document.createElement("wbr");
+    }
+  },
+};
 
 class SourceUrlAutocomplete extends AutocompleteTextInput {
   dataSourceView: DataSourceView;
   dirty: WatchableValueInterface<boolean>;
   constructor(dataSourceView: DataSourceView) {
     const { manager } = dataSourceView.source.layer;
-    const sourceCompleter = (
-      value: string,
-      cancellationToken: CancellationToken,
-    ) =>
-      manager.dataSourceProviderRegistry
-        .completeUrl({
+    const sourceCompleter: Completer = async (
+      { value },
+      signal: AbortSignal,
+      progressListener: ProgressListener,
+    ) => {
+      const originalResult =
+        await manager.dataSourceProviderRegistry.completeUrl({
           url: value,
-          chunkManager: manager.chunkManager,
-          cancellationToken,
-        })
-        .then((originalResult) => ({
-          completions: originalResult.completions,
-          makeElement: makeCompletionElementWithDescription,
-          offset: originalResult.offset,
-          showSingleResult: true,
-        }));
-    super({ completer: sourceCompleter, delay: 0 });
+          signal,
+          progressListener,
+        });
+      return {
+        ...originalResult,
+        makeElement: makeCompletionElementWithDescription,
+        showSingleResult: true,
+      };
+    };
+    super({
+      completer: sourceCompleter,
+      syntaxHighlighter: dataSourceUrlSyntaxHighlighter,
+      delay: 0,
+    });
     this.placeholder = "Data source URL";
     this.dataSourceView = dataSourceView;
     this.element.classList.add("neuroglancer-layer-data-source-url-input");
@@ -309,14 +336,6 @@ export class DataSourceView extends RefCounted {
       const { source } = this;
       const existingSpec = source.spec;
       const userLayer = this.source.layer;
-      url = userLayer.manager.dataSourceProviderRegistry.normalizeUrl({ url });
-      if (url !== urlInput.value) {
-        urlInput.disableCompletion();
-        urlInput.setValueAndSelection(url, {
-          begin: url.length,
-          end: url.length,
-        });
-      }
       urlInput.dirty.value = false;
       // If url is non-empty and unchanged, don't set spec, as that would trigger a reload of the
       // data source.  If the url is empty, always set spec in order to possible remove the empty
@@ -333,12 +352,14 @@ export class DataSourceView extends RefCounted {
         try {
           const newName =
             userLayer.manager.dataSourceProviderRegistry.suggestLayerName(url);
-          changeLayerName(userLayer.managedLayer, newName);
+          if (newName) {
+            changeLayerName(userLayer.managedLayer, newName);
+          }
         } catch {
           // Ignore errors obtaining a suggested layer name.
         }
       }
-      source.spec = { ...existingSpec, url };
+      source.spec = { ...existingSpec, url, setManually: true };
     };
     urlInput.onCommit.add(updateUrlFromView);
 
@@ -347,6 +368,12 @@ export class DataSourceView extends RefCounted {
     element.appendChild(urlInput.element);
     element.appendChild(
       this.registerDisposer(new MessagesView(source.messages)).element,
+    );
+    const progressListenerWidget = new ProgressListenerWidget();
+    element.appendChild(progressListenerWidget.element);
+    source.progressListener.addListener(progressListenerWidget);
+    this.registerDisposer(() =>
+      source.progressListener.removeListener(progressListenerWidget),
     );
     this.updateView();
   }
@@ -400,6 +427,7 @@ export class LayerDataSourcesTab extends Tab {
     title: "Add additional data source",
   });
   private layerTypeDetection = document.createElement("div");
+  private multiChannelLayerCreate = document.createElement("div");
   private layerTypeElement = document.createElement("span");
   private dataSourcesContainer = document.createElement("div");
   private reRender: DebouncedFunction;
@@ -422,7 +450,8 @@ export class LayerDataSourcesTab extends Tab {
     });
     element.appendChild(this.dataSourcesContainer);
     if (layer instanceof NewUserLayer) {
-      const { layerTypeDetection, layerTypeElement } = this;
+      const { layerTypeDetection, layerTypeElement, multiChannelLayerCreate } =
+        this;
       layerTypeDetection.style.display = "none";
       layerTypeElement.classList.add(
         "neuroglancer-layer-data-sources-tab-type-detection-type",
@@ -437,6 +466,33 @@ export class LayerDataSourcesTab extends Tab {
       layerTypeDetection.addEventListener("click", () => {
         changeLayerTypeToDetected(layer);
       });
+      // Image layers provide a second option
+      multiChannelLayerCreate.classList.add(
+        "neuroglancer-layer-data-sources-tab-type-detection",
+      );
+      const multiChannelLayerCreateLabel = document.createElement("span");
+      multiChannelLayerCreateLabel.classList.add(
+        "neuroglancer-layer-data-sources-tab-type-detection-type",
+      );
+      multiChannelLayerCreateLabel.textContent = "multi-channel image";
+      multiChannelLayerCreate.appendChild(
+        document.createTextNode("Create as "),
+      );
+      multiChannelLayerCreate.appendChild(multiChannelLayerCreateLabel);
+      multiChannelLayerCreate.appendChild(document.createTextNode(" layer"));
+      multiChannelLayerCreate.addEventListener("click", () => {
+        changeLayerTypeToDetected(layer);
+        layer.managedLayer.registerDisposer(
+          layer.managedLayer.readyStateChanged.add(() => {
+            if (layer.managedLayer.isReady()) {
+              createImageLayerAsMultiChannel(layer.managedLayer, makeLayer);
+            }
+          }),
+        );
+      });
+      multiChannelLayerCreate.style.display = "none";
+      multiChannelLayerCreate.style.marginTop = "0.5em";
+      element.appendChild(multiChannelLayerCreate);
     }
     const reRender = (this.reRender = animationFrameDebounce(() =>
       this.updateView(),
@@ -460,7 +516,7 @@ export class LayerDataSourcesTab extends Tab {
       return layerConstructor;
     })();
     if (layerConstructor === this.detectedLayerConstructor) return;
-    const { layerTypeDetection } = this;
+    const { layerTypeDetection, multiChannelLayerCreate } = this;
     this.detectedLayerConstructor = layerConstructor;
     if (layerConstructor !== undefined) {
       const { layerTypeElement } = this;
@@ -469,8 +525,11 @@ export class LayerDataSourcesTab extends Tab {
         "Click here or press enter in the data source URL input box to create as " +
         `${layerConstructor.type} layer`;
       layerTypeDetection.style.display = "";
+      multiChannelLayerCreate.style.display =
+        layerConstructor.type === "image" ? "" : "none";
     } else {
       layerTypeDetection.style.display = "none";
+      multiChannelLayerCreate.style.display = "none";
     }
   }
 

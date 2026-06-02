@@ -22,20 +22,26 @@ import {
   ChunkSource,
 } from "#src/chunk_manager/backend.js";
 import { ChunkPriorityTier, ChunkState } from "#src/chunk_manager/base.js";
-import { WithSharedCredentialsProviderCounterpart } from "#src/credentials_provider/shared_counterpart.js";
-import type { ChunkedGraphChunkSpecification } from "#src/datasource/graphene/base.js";
+import type {
+  ChunkedGraphChunkSpecification,
+  HttpSource,
+} from "#src/datasource/graphene/base.js";
 import {
   getGrapheneFragmentKey,
   GRAPHENE_MESH_NEW_SEGMENT_RPC_ID,
-  responseIdentity,
   ChunkedGraphSourceParameters,
   MeshSourceParameters,
   CHUNKED_GRAPH_LAYER_RPC_ID,
   CHUNKED_GRAPH_RENDER_LAYER_UPDATE_SOURCES_RPC_ID,
   RENDER_RATIO_LIMIT,
   isBaseSegmentId,
+  parseGrapheneError,
+  getHttpSource,
 } from "#src/datasource/graphene/base.js";
 import { decodeManifestChunk } from "#src/datasource/precomputed/backend.js";
+import { WithSharedKvStoreContextCounterpart } from "#src/kvstore/backend.js";
+import type { KvStoreWithPath, ReadResponse } from "#src/kvstore/index.js";
+import { readKvStore } from "#src/kvstore/index.js";
 import type { FragmentChunk, ManifestChunk } from "#src/mesh/backend.js";
 import { assignMeshFragmentData, MeshSource } from "#src/mesh/backend.js";
 import { decodeDraco } from "#src/mesh/draco/index.js";
@@ -60,16 +66,10 @@ import {
 } from "#src/sliceview/base.js";
 import { computeChunkBounds } from "#src/sliceview/volume/backend.js";
 import { Uint64Set } from "#src/uint64_set.js";
-import { fetchSpecialHttpByteRange } from "#src/util/byte_range_http_requests.js";
-import type { CancellationToken } from "#src/util/cancellation.js";
 import { vec3, vec3Key } from "#src/util/geom.js";
-import { responseArrayBuffer, responseJson } from "#src/util/http_request.js";
-import type {
-  SpecialProtocolCredentials,
-  SpecialProtocolCredentialsProvider,
-} from "#src/util/special_protocol_request.js";
-import { cancellableFetchSpecialOk } from "#src/util/special_protocol_request.js";
-import { Uint64 } from "#src/util/uint64.js";
+import { HttpError } from "#src/util/http_request.js";
+import { parseUint64, verifyStringArray } from "#src/util/json.js";
+import { Signal } from "#src/util/signal.js";
 import {
   getBasePriority,
   getPriorityTier,
@@ -78,78 +78,69 @@ import {
 import type { RPC } from "#src/worker_rpc.js";
 import { registerSharedObject, registerRPC } from "#src/worker_rpc.js";
 
-function getVerifiedFragmentPromise(
-  credentialsProvider: SpecialProtocolCredentialsProvider,
-  chunk: FragmentChunk,
-  parameters: MeshSourceParameters,
-  cancellationToken: CancellationToken,
-) {
-  if (chunk.fragmentId && chunk.fragmentId.charAt(0) === "~") {
-    const parts = chunk.fragmentId.substr(1).split(":");
-    const startOffset = Number(parts[1]);
-    const endOffset = startOffset + Number(parts[2]);
-    return fetchSpecialHttpByteRange(
-      credentialsProvider,
-      `${parameters.fragmentUrl}/initial/${parts[0]}`,
-      startOffset,
-      endOffset,
-      cancellationToken,
+function downloadFragmentWithSharding(
+  fragmentKvStore: KvStoreWithPath,
+  fragmentId: string,
+  signal: AbortSignal,
+): Promise<ReadResponse> {
+  if (fragmentId && fragmentId.charAt(0) === "~") {
+    const parts = fragmentId.substring(1).split(":");
+    const byteRange = { offset: Number(parts[1]), length: Number(parts[2]) };
+    return readKvStore(
+      fragmentKvStore.store,
+      `${fragmentKvStore.path}initial/${parts[0]}`,
+      { signal, byteRange, throwIfMissing: true },
     );
   }
-  return cancellableFetchSpecialOk(
-    credentialsProvider,
-    `${parameters.fragmentUrl}/dynamic/${chunk.fragmentId}`,
-    {},
-    responseArrayBuffer,
-    cancellationToken,
+  return readKvStore(
+    fragmentKvStore.store,
+    `${fragmentKvStore.path}dynamic/${fragmentId}`,
+    { signal, throwIfMissing: true },
   );
 }
 
-function getFragmentDownloadPromise(
-  credentialsProvider: SpecialProtocolCredentialsProvider,
-  chunk: FragmentChunk,
+function downloadFragment(
+  fragmentKvStore: KvStoreWithPath,
+  fragmentId: string,
   parameters: MeshSourceParameters,
-  cancellationToken: CancellationToken,
-) {
-  let fragmentDownloadPromise;
+  signal: AbortSignal,
+): Promise<ReadResponse> {
   if (parameters.sharding) {
-    fragmentDownloadPromise = getVerifiedFragmentPromise(
-      credentialsProvider,
-      chunk,
-      parameters,
-      cancellationToken,
-    );
+    return downloadFragmentWithSharding(fragmentKvStore, fragmentId, signal);
   } else {
-    fragmentDownloadPromise = cancellableFetchSpecialOk(
-      credentialsProvider,
-      `${parameters.fragmentUrl}/${chunk.fragmentId}`,
-      {},
-      responseArrayBuffer,
-      cancellationToken,
+    return readKvStore(
+      fragmentKvStore.store,
+      `${fragmentKvStore.path}/${fragmentId}`,
+      { signal, throwIfMissing: true },
     );
   }
-  return fragmentDownloadPromise;
 }
 
 async function decodeDracoFragmentChunk(
   chunk: FragmentChunk,
-  response: ArrayBuffer,
+  response: Uint8Array,
 ) {
-  const rawMesh = await decodeDraco(new Uint8Array(response));
+  const rawMesh = await decodeDraco(response);
   assignMeshFragmentData(chunk, rawMesh);
 }
 
 @registerSharedObject()
 export class GrapheneMeshSource extends WithParameters(
-  WithSharedCredentialsProviderCounterpart<SpecialProtocolCredentials>()(
-    MeshSource,
-  ),
+  WithSharedKvStoreContextCounterpart(MeshSource),
   MeshSourceParameters,
 ) {
   manifestRequestCount = new Map<string, number>();
   newSegments = new Uint64Set();
 
-  addNewSegment(segment: Uint64) {
+  manifestHttpSource = getHttpSource(
+    this.sharedKvStoreContext.kvStoreContext,
+    this.parameters.manifestUrl,
+  );
+  fragmentKvStore = this.sharedKvStoreContext.kvStoreContext.getKvStore(
+    this.parameters.fragmentUrl,
+  );
+
+  addNewSegment(segment: bigint) {
     const { newSegments } = this;
     newSegments.add(segment);
     const TEN_MINUTES = 1000 * 60 * 10;
@@ -158,53 +149,46 @@ export class GrapheneMeshSource extends WithParameters(
     }, TEN_MINUTES);
   }
 
-  async download(chunk: ManifestChunk, cancellationToken: CancellationToken) {
+  async download(chunk: ManifestChunk, signal: AbortSignal) {
     const { parameters, newSegments, manifestRequestCount } = this;
     if (isBaseSegmentId(chunk.objectId, parameters.nBitsForLayerId)) {
       return decodeManifestChunk(chunk, { fragments: [] });
     }
-    const url = `${parameters.manifestUrl}/manifest`;
-    const manifestUrl = `${url}/${chunk.objectId}:${parameters.lod}?verify=1&prepend_seg_ids=1`;
-    await cancellableFetchSpecialOk(
-      this.credentialsProvider,
-      manifestUrl,
-      {},
-      responseJson,
-      cancellationToken,
-    ).then((response) => {
-      const chunkIdentifier = manifestUrl;
-      if (newSegments.has(chunk.objectId)) {
-        const requestCount =
-          (manifestRequestCount.get(chunkIdentifier) || 0) + 1;
-        manifestRequestCount.set(chunkIdentifier, requestCount);
-        setTimeout(
-          () => {
-            this.chunkManager.queueManager.updateChunkState(
-              chunk,
-              ChunkState.QUEUED,
-            );
-          },
-          2 ** requestCount * 1000,
-        );
-      } else {
-        manifestRequestCount.delete(chunkIdentifier);
-      }
-      return decodeManifestChunk(chunk, response);
-    });
+    const { fetchOkImpl, baseUrl } = this.manifestHttpSource;
+    const manifestPath = `/manifest/${chunk.objectId}:${parameters.lod}?verify=1&prepend_seg_ids=1`;
+    const response = await (
+      await fetchOkImpl(baseUrl + manifestPath, { signal })
+    ).json();
+    const chunkIdentifier = manifestPath;
+    if (newSegments.has(chunk.objectId)) {
+      const requestCount = (manifestRequestCount.get(chunkIdentifier) ?? 0) + 1;
+      manifestRequestCount.set(chunkIdentifier, requestCount);
+      setTimeout(
+        () => {
+          this.chunkManager.queueManager.updateChunkState(
+            chunk,
+            ChunkState.QUEUED,
+          );
+        },
+        2 ** requestCount * 1000,
+      );
+    } else {
+      manifestRequestCount.delete(chunkIdentifier);
+    }
+    return decodeManifestChunk(chunk, response);
   }
 
-  async downloadFragment(
-    chunk: FragmentChunk,
-    cancellationToken: CancellationToken,
-  ) {
-    const { parameters } = this;
-    const response = await getFragmentDownloadPromise(
-      undefined,
-      chunk,
-      parameters,
-      cancellationToken,
+  async downloadFragment(chunk: FragmentChunk, signal: AbortSignal) {
+    const { response } = await downloadFragment(
+      this.fragmentKvStore,
+      chunk.fragmentId!,
+      this.parameters,
+      signal,
     );
-    await decodeDracoFragmentChunk(chunk, response);
+    await decodeDracoFragmentChunk(
+      chunk,
+      new Uint8Array(await response.arrayBuffer()),
+    );
   }
 
   getFragmentKey(objectKey: string | null, fragmentId: string) {
@@ -213,11 +197,88 @@ export class GrapheneMeshSource extends WithParameters(
   }
 }
 
+class LeavesManyProxy {
+  pendingRequests = new Map<
+    string,
+    [Signal<(response: any) => void>, Uint64Set, (reason?: any) => void]
+  >();
+
+  constructor(private httpSource: HttpSource) {}
+
+  getQueueSizeForBounds(bounds: string) {
+    const requestsForBounds = this.pendingRequests.get(bounds);
+    return requestsForBounds ? requestsForBounds[1].size : 0;
+  }
+
+  async request(
+    segment: bigint,
+    bounds: string,
+    signal: AbortSignal,
+  ): Promise<any> {
+    if (signal.aborted) {
+      return;
+    }
+    const { pendingRequests } = this;
+    let pendingRequest = pendingRequests.get(bounds);
+    if (!pendingRequest) {
+      const requestSignal = new Signal<(request: any) => void>();
+      const abortController = new AbortController();
+      const segments = new Uint64Set();
+      const timeoutId = setTimeout(async () => {
+        pendingRequests.delete(bounds);
+        const { fetchOkImpl, baseUrl } = this.httpSource;
+        try {
+          const response = await fetchOkImpl(
+            `${baseUrl}/leaves_many?int64_as_str=1&bounds=${bounds}`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                node_ids: segments.toJSON(),
+              }),
+              signal: abortController.signal,
+            },
+          ).then((res) => res.json());
+          requestSignal.dispatch(response);
+        } catch (e) {
+          requestSignal.dispatch(e);
+        }
+      }, 0);
+      const cancelPendingRequest = (reason?: any) => {
+        clearTimeout(timeoutId);
+        abortController.abort(reason);
+        pendingRequests.delete(bounds);
+      };
+      pendingRequest = [requestSignal, segments, cancelPendingRequest];
+      pendingRequests.set(bounds, pendingRequest);
+    }
+    const [requestSignal, segments, cancelPendingRequest] = pendingRequest;
+    segments.add(segment);
+    return new Promise((f, r) => {
+      signal.addEventListener("abort", () => {
+        segments.delete(segment);
+        if (segments.size === 0) {
+          cancelPendingRequest(signal.reason);
+        }
+        // the above cancel may cause a rejection as well
+        r(new DOMException("chunk download cancelled", "AbortError"));
+      });
+      const unregister = requestSignal.add((response) => {
+        unregister();
+        if (response instanceof Error) {
+          r(response);
+        } else {
+          f(response[segment.toString()]);
+        }
+      });
+    });
+  }
+}
+
 export class ChunkedGraphChunk extends Chunk {
   chunkGridPosition: Float32Array;
   source: GrapheneChunkedGraphChunkSource | null = null;
-  segment: Uint64;
-  leaves: Uint64[] = [];
+  segment: bigint;
+  leaves: BigUint64Array = new BigUint64Array(0);
   chunkDataSize: Uint32Array | null;
 
   initializeVolumeChunk(key: string, chunkGridPosition: Float32Array) {
@@ -225,10 +286,30 @@ export class ChunkedGraphChunk extends Chunk {
     this.chunkGridPosition = Float32Array.from(chunkGridPosition);
   }
 
+  get downloadSlots(): number {
+    const { source, bounds } = this;
+    if (!source || !bounds) return super.downloadSlots;
+    const queueSize = source.leavesManyProxy.getQueueSizeForBounds(bounds);
+    // requests that can be bundled with a prior request are considered free
+    return queueSize > 0 ? 0 : super.downloadSlots;
+  }
+
+  get bounds() {
+    const { source } = this;
+    if (!source) return undefined;
+    const chunkPosition = computeChunkBounds(source, this);
+    const chunkDataSize = this.chunkDataSize!;
+    return (
+      `${chunkPosition[0]}-${chunkPosition[0] + chunkDataSize[0]}_` +
+      `${chunkPosition[1]}-${chunkPosition[1] + chunkDataSize[1]}_` +
+      `${chunkPosition[2]}-${chunkPosition[2] + chunkDataSize[2]}`
+    );
+  }
+
   initializeChunkedGraphChunk(
     key: string,
     chunkGridPosition: Float32Array,
-    segment: Uint64,
+    segment: bigint,
   ) {
     this.initializeVolumeChunk(key, chunkGridPosition);
     this.chunkDataSize = null;
@@ -239,7 +320,7 @@ export class ChunkedGraphChunk extends Chunk {
 
   downloadSucceeded() {
     this.systemMemoryBytes = 16; // this.segment
-    this.systemMemoryBytes += 16 * this.leaves.length;
+    this.systemMemoryBytes += this.leaves.byteLength;
     this.queueManager.updateChunkState(this, ChunkState.SYSTEM_MEMORY_WORKER);
     if (this.priorityTier < ChunkPriorityTier.RECENT) {
       this.source!.chunkManager.scheduleUpdateChunkPriorities();
@@ -248,29 +329,29 @@ export class ChunkedGraphChunk extends Chunk {
   }
 
   freeSystemMemory() {
-    this.leaves = [];
+    this.leaves = new BigUint64Array(0);
   }
 }
 
 function decodeChunkedGraphChunk(leaves: string[]) {
-  const final: Uint64[] = new Array(leaves.length);
-  for (let i = 0; i < final.length; ++i) {
-    final[i] = Uint64.parseString(leaves[i]);
-  }
-  return final;
+  return BigUint64Array.from(leaves, parseUint64);
 }
 
 @registerSharedObject()
 export class GrapheneChunkedGraphChunkSource extends WithParameters(
-  WithSharedCredentialsProviderCounterpart<SpecialProtocolCredentials>()(
-    ChunkSource,
-  ),
+  WithSharedKvStoreContextCounterpart(ChunkSource),
   ChunkedGraphSourceParameters,
 ) {
   spec: ChunkedGraphChunkSpecification;
-  chunks: Map<string, ChunkedGraphChunk>;
+  declare chunks: Map<string, ChunkedGraphChunk>;
   tempChunkDataSize: Uint32Array;
   tempChunkPosition: Float32Array;
+  leavesManyProxy: LeavesManyProxy;
+
+  httpSource = getHttpSource(
+    this.sharedKvStoreContext.kvStoreContext,
+    this.parameters.url,
+  );
 
   constructor(rpc: RPC, options: any) {
     super(rpc, options);
@@ -278,39 +359,39 @@ export class GrapheneChunkedGraphChunkSource extends WithParameters(
     const rank = this.spec.rank;
     this.tempChunkDataSize = new Uint32Array(rank);
     this.tempChunkPosition = new Float32Array(rank);
+    this.leavesManyProxy = new LeavesManyProxy(this.httpSource);
   }
 
-  async download(
-    chunk: ChunkedGraphChunk,
-    cancellationToken: CancellationToken,
-  ): Promise<void> {
-    const { parameters } = this;
-    const chunkPosition = this.computeChunkBounds(chunk);
-    const chunkDataSize = chunk.chunkDataSize!;
-    const bounds =
-      `${chunkPosition[0]}-${chunkPosition[0] + chunkDataSize[0]}_` +
-      `${chunkPosition[1]}-${chunkPosition[1] + chunkDataSize[1]}_` +
-      `${chunkPosition[2]}-${chunkPosition[2] + chunkDataSize[2]}`;
-
-    const request = cancellableFetchSpecialOk(
-      this.credentialsProvider,
-      `${parameters.url}/${chunk.segment}/leaves?int64_as_str=1&bounds=${bounds}`,
-      {},
-      responseIdentity,
-      cancellationToken,
-    );
-    await this.withErrorMessage(
-      request,
-      `Fetching leaves of segment ${chunk.segment} in region ${bounds}: `,
-    )
-      .then((res) => res.json())
-      .then((res) => {
-        chunk.leaves = decodeChunkedGraphChunk(res.leaf_ids);
-      })
-      .catch((err) => console.error(err));
+  async download(chunk: ChunkedGraphChunk, signal: AbortSignal): Promise<void> {
+    const wait = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+    const { segment, bounds } = chunk;
+    if (!bounds) return;
+    const numTries = 5;
+    for (let i = 0; i < numTries; i++) {
+      const request = this.leavesManyProxy.request(segment, bounds, signal);
+      try {
+        const res = await this.withErrorMessage(
+          request,
+          `Fetching leaves of segment ${chunk.segment} in region ${bounds}: `,
+        );
+        verifyStringArray(res);
+        chunk.leaves = decodeChunkedGraphChunk(res);
+        return;
+      } catch (e) {
+        if (e instanceof Error && e.name === "AbortError") {
+          throw e;
+        }
+        if (i < numTries - 1) {
+          await wait(2 ** i * 1000);
+        } else {
+          throw e;
+        }
+      }
+    }
   }
 
-  getChunk(chunkGridPosition: Float32Array, segment: Uint64) {
+  getChunk(chunkGridPosition: Float32Array, segment: bigint) {
     const key = `${vec3Key(chunkGridPosition)}-${segment}`;
     let chunk = <ChunkedGraphChunk>this.chunks.get(key);
 
@@ -322,25 +403,17 @@ export class GrapheneChunkedGraphChunkSource extends WithParameters(
     return chunk;
   }
 
-  computeChunkBounds(chunk: ChunkedGraphChunk) {
-    return computeChunkBounds(this, chunk);
-  }
-
-  async withErrorMessage(
-    promise: Promise<Response>,
+  async withErrorMessage<T>(
+    promise: Promise<T>,
     errorPrefix: string,
-  ): Promise<Response> {
-    const response = await promise;
-    if (response.ok) {
-      return response;
-    }
-    let msg: string;
-    try {
-      msg = (await response.json()).message;
-    } catch {
-      msg = await response.text();
-    }
-    throw new Error(`[${response.status}] ${errorPrefix}${msg}`);
+  ): Promise<T> {
+    return promise.catch(async (e) => {
+      if (e instanceof HttpError && e.response) {
+        const msg = await parseGrapheneError(e);
+        throw new Error(`[${e.response.status}] ${errorPrefix}${msg ?? ""}`);
+      }
+      throw e;
+    });
   }
 }
 
@@ -466,7 +539,7 @@ export class ChunkedGraphLayer extends withSegmentationLayerBackendState(
 
           forEachVisibleSegment(this, (segment, _) => {
             if (isBaseSegmentId(segment, this.nBitsForLayerId.value)) return; // TODO maybe support highBitRepresentation?
-            const chunk = source.getChunk(curPositionInChunks, segment.clone());
+            const chunk = source.getChunk(curPositionInChunks, segment);
             chunkManager.requestChunk(
               chunk,
               priorityTier,
@@ -484,7 +557,7 @@ export class ChunkedGraphLayer extends withSegmentationLayerBackendState(
   }
 
   private forEachSelectedRootWithLeaves(
-    callback: (rootObjectKey: string, leaves: Uint64[]) => void,
+    callback: (rootObject: bigint, leaves: BigUint64Array) => void,
   ) {
     const { source } = this;
 
@@ -494,7 +567,7 @@ export class ChunkedGraphLayer extends withSegmentationLayerBackendState(
         chunk.priorityTier < ChunkPriorityTier.RECENT
       ) {
         if (this.visibleSegments.has(chunk.segment) && chunk.leaves.length) {
-          callback(chunk.segment.toString(), chunk.leaves);
+          callback(chunk.segment, chunk.leaves);
         }
       }
     }
@@ -505,51 +578,41 @@ export class ChunkedGraphLayer extends withSegmentationLayerBackendState(
   }, 100);
 
   private updateDisplayState() {
-    const visibleLeaves = new Map<string, Uint64Set>();
-    const capacities = new Map<string, number>();
+    const visibleLeaves = new Map<bigint, Uint64Set>();
+    const capacities = new Map<bigint, number>();
 
     // Reserve
-    this.forEachSelectedRootWithLeaves((rootObjectKey, leaves) => {
-      if (!capacities.has(rootObjectKey)) {
-        capacities.set(rootObjectKey, leaves.length);
-      } else {
-        capacities.set(
-          rootObjectKey,
-          capacities.get(rootObjectKey)! + leaves.length,
-        );
-      }
+    this.forEachSelectedRootWithLeaves((rootObject, leaves) => {
+      capacities.set(
+        rootObject,
+        (capacities.get(rootObject) ?? 0) + leaves.length,
+      );
     });
 
     // Collect unique leaves
-    this.forEachSelectedRootWithLeaves((rootObjectKey, leaves) => {
-      if (!visibleLeaves.has(rootObjectKey)) {
-        visibleLeaves.set(rootObjectKey, new Uint64Set());
-        visibleLeaves
-          .get(rootObjectKey)!
-          .reserve(capacities.get(rootObjectKey)!);
-        visibleLeaves
-          .get(rootObjectKey)!
-          .add(Uint64.parseString(rootObjectKey));
+    this.forEachSelectedRootWithLeaves((rootObject, leaves) => {
+      if (!visibleLeaves.has(rootObject)) {
+        visibleLeaves.set(rootObject, new Uint64Set());
+        visibleLeaves.get(rootObject)!.reserve(capacities.get(rootObject)!);
+        visibleLeaves.get(rootObject)!.add(rootObject);
       }
-      visibleLeaves.get(rootObjectKey)!.add(leaves);
+      visibleLeaves.get(rootObject)!.add(leaves);
     });
 
     for (const [root, leaves] of visibleLeaves) {
       // TODO: Delete segments not visible anymore from segmentEquivalences - requires a faster data
       // structure, though.
 
-      /*if (this.segmentEquivalences.has(Uint64.parseString(root))) {
-        this.segmentEquivalences.delete([...this.segmentEquivalences.setElements(Uint64.parseString(root))].filter(x
+      /*if (this.segmentEquivalences.has(root)) {
+        this.segmentEquivalences.delete([...this.segmentEquivalences.setElements(root)].filter(x
       => !leaves.has(x) && !this.visibleSegments.has(x)));
       }*/
       const filteredLeaves = [...leaves].filter(
         (x) => !this.segmentEquivalences.has(x),
       );
 
-      const rootInt = Uint64.parseString(root);
-
       for (const leaf of filteredLeaves) {
-        this.segmentEquivalences.link(rootInt, leaf);
+        this.segmentEquivalences.link(root, leaf);
       }
     }
   }
@@ -577,5 +640,5 @@ registerRPC(CHUNKED_GRAPH_RENDER_LAYER_UPDATE_SOURCES_RPC_ID, function (x) {
 
 registerRPC(GRAPHENE_MESH_NEW_SEGMENT_RPC_ID, function (x) {
   const obj = <GrapheneMeshSource>this.get(x.rpcId);
-  obj.addNewSegment(Uint64.parseString(x.segment));
+  obj.addNewSegment(x.segment);
 });

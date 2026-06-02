@@ -40,6 +40,7 @@ import {
   TrackableSidePanelLocation,
 } from "#src/ui/side_panel_location.js";
 import { animationFrameDebounce } from "#src/util/animation_frame_debounce.js";
+import { createSteppedCssGradient } from "#src/util/color.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { updateChildren } from "#src/util/dom.js";
 import { emptyToUndefined } from "#src/util/json.js";
@@ -47,6 +48,7 @@ import type { Trackable } from "#src/util/trackable.js";
 import { CheckboxIcon } from "#src/widget/checkbox_icon.js";
 import { makeDeleteButton } from "#src/widget/delete_button.js";
 import { makeIcon } from "#src/widget/icon.js";
+import { LayerTypeIndicatorWidget } from "#src/widget/layer_type_indicator.js";
 
 const DEFAULT_LAYER_LIST_PANEL_LOCATION: SidePanelLocation = {
   ...DEFAULT_SIDE_PANEL_LOCATION,
@@ -72,7 +74,7 @@ export class LayerListPanelState implements Trackable {
   }
 }
 
-class LayerVisibilityWidget extends RefCounted {
+export class LayerVisibilityWidget extends RefCounted {
   element = document.createElement("div");
   constructor(public layer: ManagedUserLayer) {
     super();
@@ -91,6 +93,8 @@ class LayerVisibilityWidget extends RefCounted {
         this.layer.setVisible(true);
       },
     });
+    hideIcon.classList.add("neuroglancer-layer-list-panel-eye-icon");
+    showIcon.classList.add("neuroglancer-layer-list-panel-eye-icon");
     element.appendChild(showIcon);
     element.appendChild(hideIcon);
     const updateView = () => {
@@ -100,6 +104,101 @@ class LayerVisibilityWidget extends RefCounted {
     };
     updateView();
     this.registerDisposer(layer.layerChanged.add(updateView));
+  }
+}
+
+class LayerColorWidget extends RefCounted {
+  element = document.createElement("div");
+  colorIndicator = document.createElement("div");
+  private colorChangeDisposer: () => void = () => {};
+
+  constructor(
+    public panel: LayerListPanel,
+    public layer: ManagedUserLayer,
+    onClick?: () => void,
+  ) {
+    super();
+    const { colorIndicator, element } = this;
+    colorIndicator.className = "neuroglancer-layer-list-panel-color-value";
+    element.className = "neuroglancer-layer-list-panel-color-value-wrapper";
+    element.appendChild(colorIndicator);
+    if (onClick !== undefined) {
+      element.addEventListener("click", onClick);
+    }
+    const updateLayerColorWidget = () => {
+      const colors = this.layer.layerBarColors;
+      const setNoColor = () => {
+        colorIndicator.style.background = "";
+        colorIndicator.style.backgroundColor = "";
+        colorIndicator.dataset.color = "unsupported";
+        this.updateTooltip(
+          "does not support a color legend or has no visible segments",
+        );
+      };
+      if (!this.layer.supportsLayerBarColorSyncOption || colors?.length === 0) {
+        setNoColor();
+        return;
+      }
+      const setRainbow = () => {
+        colorIndicator.dataset.color = "rainbow";
+        this.updateTooltip("is multi-colored or has unknown color");
+      };
+      if (colors === undefined) {
+        setRainbow();
+        return;
+      }
+
+      const setSingleColor = () => {
+        colorIndicator.style.background = "";
+        colorIndicator.style.backgroundColor = colors[0];
+        colorIndicator.dataset.color = "solid";
+        this.updateTooltip(`has a single primary color`);
+      };
+
+      const setMultiColor = () => {
+        colorIndicator.style.backgroundColor = "";
+        colorIndicator.dataset.color = "multi";
+        colorIndicator.style.background = createSteppedCssGradient(
+          colors.reverse(),
+          true /*conic*/,
+        );
+        this.updateTooltip(`has multiple primary colors`);
+      };
+      if (colors.length === 1) setSingleColor();
+      else setMultiColor();
+    };
+
+    const listenForColorChange = () => {
+      if (!this.layer.isReady()) return;
+      this.colorChangeDisposer();
+      this.colorChangeDisposer = layer.observeLayerColor(() => {
+        updateLayerColorWidget();
+      });
+    };
+    this.registerDisposer(this.colorChangeDisposer);
+    this.registerDisposer(
+      this.layer.readyStateChanged.add(listenForColorChange),
+    );
+
+    this.registerDisposer(
+      layer.layerChanged.add(() => {
+        element.dataset.visible = this.layer.visible.toString();
+        updateLayerColorWidget();
+      }),
+    );
+    element.dataset.visible = this.layer.visible.toString();
+    listenForColorChange();
+    updateLayerColorWidget();
+  }
+
+  private updateTooltip(message: string) {
+    const { visible, archived } = this.layer;
+    if (!visible || archived) {
+      const stateMessage = archived ? "archived" : "hidden";
+      this.element.title = `This layer is ${stateMessage}.\nClick to show layer.`;
+    } else {
+      this.element.title = `This visible layer ${message}.\nClick to hide layer.`;
+    }
   }
 }
 
@@ -143,6 +242,10 @@ class LayerListItem extends RefCounted {
     const { element, numberElement } = this;
     element.classList.add("neuroglancer-layer-list-panel-item");
     numberElement.classList.add("neuroglancer-layer-list-panel-item-number");
+    const layerNameWidget = this.registerDisposer(new LayerNameWidget(layer));
+    layerNameWidget.element.classList.add(
+      "neuroglancer-layer-list-panel-item-name",
+    );
     element.appendChild(
       this.registerDisposer(
         new TrackableBooleanCheckbox(
@@ -156,24 +259,30 @@ class LayerListItem extends RefCounted {
             changed: layer.layerChanged,
           },
           {
-            enableTitle: "Archive layer (disable and remove from layer groups)",
-            disableTitle:
+            enabledTitle:
+              "Archive layer (disable and remove from layer groups)",
+            disabledTitle:
               "Unarchive layer (enable and add to all layer groups)",
           },
         ),
       ).element,
     );
     element.appendChild(numberElement);
-    element.appendChild(
-      this.registerDisposer(new LayerVisibilityWidget(layer)).element,
-    );
-    element.appendChild(
-      this.registerDisposer(new LayerNameWidget(layer)).element,
-    );
+    const colorIndicator = new LayerColorWidget(panel, layer, () => {
+      this.layer.setVisible(!this.layer.visible);
+    });
+    element.appendChild(colorIndicator.element);
+    element.appendChild(new LayerTypeIndicatorWidget(layer).element);
+    element.appendChild(layerNameWidget.element);
     element.appendChild(
       this.registerDisposer(makeSelectedLayerSidePanelCheckboxIcon(layer))
         .element,
     );
+    const visibilityIcon = new LayerVisibilityWidget(layer);
+    visibilityIcon.element.classList.add(
+      "neuroglancer-layer-list-panel-item-visibility",
+    );
+    element.appendChild(visibilityIcon.element);
     const deleteButton = makeDeleteButton({
       title: "Delete layer",
       onClick: () => {
@@ -269,9 +378,7 @@ export class LayerListPanel extends SidePanel {
       for (const layer of self.layerManager.managedLayers) {
         if (!layer.archived) ++numNonArchivedLayers;
       }
-      const numberElementWidth = `${
-        (numNonArchivedLayers + 1).toString().length
-      }ch`;
+      const numberElementWidth = `${numNonArchivedLayers.toString().length}ch`;
       for (const layer of self.layerManager.managedLayers) {
         if (layer.visible) {
           ++numVisible;
@@ -290,7 +397,7 @@ export class LayerListPanel extends SidePanel {
         }
         const { nonArchivedLayerIndex } = layer;
         item.numberElement.style.width = numberElementWidth;
-        if (nonArchivedLayerIndex === -1) {
+        if (layer.archived) {
           item.numberElement.style.visibility = "hidden";
         } else {
           item.numberElement.style.visibility = "";
@@ -298,6 +405,7 @@ export class LayerListPanel extends SidePanel {
         }
         item.element.dataset.selected = (layer === selectedLayer).toString();
         item.element.dataset.archived = layer.archived.toString();
+        item.element.dataset.visible = layer.visible.toString();
         yield item.element;
       }
       for (const [userLayer, item] of items) {

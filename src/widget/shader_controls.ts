@@ -17,7 +17,6 @@
 import { debounce } from "lodash-es";
 import type { DisplayContext } from "#src/display_context.js";
 import type { UserLayer, UserLayerConstructor } from "#src/layer/index.js";
-import type { ToolActivation } from "#src/ui/tool.js";
 import { registerTool } from "#src/ui/tool.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { removeChildren } from "#src/util/dom.js";
@@ -75,16 +74,6 @@ function getShaderLayerControlFactory<LayerType extends UserLayer>(
     case "checkbox":
       return checkboxLayerControl(() => controlState.trackable);
     case "imageInvlerp": {
-      let histogramIndex = 0;
-      for (const [
-        otherName,
-        {
-          control: { type: otherType },
-        },
-      ] of shaderControlState.state) {
-        if (otherName === controlId) break;
-        if (otherType === "imageInvlerp") ++histogramIndex;
-      }
       return channelInvlerpLayerControl(() => ({
         dataType: control.dataType,
         defaultChannel: control.default.channel,
@@ -92,26 +81,16 @@ function getShaderLayerControlFactory<LayerType extends UserLayer>(
         channelCoordinateSpaceCombiner:
           shaderControlState.channelCoordinateSpaceCombiner,
         histogramSpecifications: shaderControlState.histogramSpecifications,
-        histogramIndex,
+        histogramIndex: calculateHistogramIndex(),
         legendShaderOptions: layerShaderControls.legendShaderOptions,
       }));
     }
     case "propertyInvlerp": {
-      let histogramIndex = 0;
-      for (const [
-        otherName,
-        {
-          control: { type: otherType },
-        },
-      ] of shaderControlState.state) {
-        if (otherName === controlId) break;
-        if (otherType === "propertyInvlerp") ++histogramIndex;
-      }
       return propertyInvlerpLayerControl(() => ({
         properties: control.properties,
         watchableValue: controlState.trackable,
         histogramSpecifications: shaderControlState.histogramSpecifications,
-        histogramIndex,
+        histogramIndex: calculateHistogramIndex(),
         legendShaderOptions: layerShaderControls.legendShaderOptions,
       }));
     }
@@ -122,8 +101,39 @@ function getShaderLayerControlFactory<LayerType extends UserLayer>(
         channelCoordinateSpaceCombiner:
           shaderControlState.channelCoordinateSpaceCombiner,
         defaultChannel: control.default.channel,
+        histogramSpecifications: shaderControlState.histogramSpecifications,
+        histogramIndex: calculateHistogramIndex(),
       }));
     }
+  }
+
+  function calculateHistogramIndex(controlType: string = control.type) {
+    const isMatchingControlType = (otherControlType: string) => {
+      if (
+        controlType === "imageInvlerp" ||
+        controlType === "transferFunction"
+      ) {
+        return (
+          otherControlType === "imageInvlerp" ||
+          otherControlType === "transferFunction"
+        );
+      } else if (controlType === "propertyInvlerp") {
+        return otherControlType === "propertyInvlerp";
+      } else {
+        throw new Error(`${controlType} does not support histogram index.`);
+      }
+    };
+    let histogramIndex = 0;
+    for (const [
+      otherName,
+      {
+        control: { type: otherType },
+      },
+    ] of shaderControlState.state) {
+      if (otherName === controlId) break;
+      if (isMatchingControlType(otherType)) histogramIndex++;
+    }
+    return histogramIndex;
   }
 }
 
@@ -235,26 +245,27 @@ class ShaderControlTool extends LayerControlTool {
         control,
       ),
     );
+    const debounceCheckValidity = this.registerCancellable(
+      debounce(() => {
+        if (
+          layerShaderControls.shaderControlState.state.get(control) ===
+          undefined
+        ) {
+          this.unbind();
+        }
+      }),
+    );
     this.registerDisposer(
       layerShaderControls.shaderControlState.controls.changed.add(
-        this.registerCancellable(
-          debounce(() => {
-            if (
-              layerShaderControls.shaderControlState.state.get(control) ===
-              undefined
-            ) {
-              this.unbind();
-            }
-          }),
-        ),
+        debounceCheckValidity,
       ),
     );
   }
-  activate(activation: ToolActivation<this>) {
+
+  isLoading() {
     const { shaderControlState } = this.layerShaderControls;
     const controlState = shaderControlState.state.get(this.control);
-    if (controlState === undefined) return;
-    super.activate(activation);
+    return controlState === undefined;
   }
 }
 
@@ -263,12 +274,28 @@ export function registerLayerShaderControlsTool<LayerType extends UserLayer>(
   getter: (layer: LayerType) => LayerShaderControls,
   toolId: string = SHADER_CONTROL_TOOL_ID,
 ) {
-  registerTool(layerType, toolId, (layer, options) => {
-    const control = verifyObjectProperty(
-      options,
-      CONTROL_JSON_KEY,
-      verifyString,
-    );
-    return new ShaderControlTool(layer, getter(layer), toolId, control);
-  });
+  registerTool(
+    layerType,
+    toolId,
+    (layer, options) => {
+      const control = verifyObjectProperty(
+        options,
+        CONTROL_JSON_KEY,
+        verifyString,
+      );
+      return new ShaderControlTool(layer, getter(layer), toolId, control);
+    },
+    (layer, onChange) => {
+      const layerShaderControls = getter(layer);
+      const { shaderControlState } = layerShaderControls;
+      if (onChange !== undefined) {
+        shaderControlState.controls.changed.addOnce(onChange);
+      }
+      const map = shaderControlState.state;
+      return Array.from(map.keys(), (key) => ({
+        type: SHADER_CONTROL_TOOL_ID,
+        [CONTROL_JSON_KEY]: key,
+      }));
+    },
+  );
 }

@@ -118,6 +118,10 @@ export class ViewerSettingsPanel extends SidePanel {
     addCheckbox("Show axis lines", viewer.showAxisLines);
     addCheckbox("Show scale bar", viewer.showScaleBar);
     addCheckbox("Show cross sections in 3-d", viewer.showPerspectiveSliceViews);
+    addCheckbox(
+      "Hide sections background 3-d",
+      viewer.hideCrossSectionBackground3D,
+    );
     addCheckbox("Show default annotations", viewer.showDefaultAnnotations);
     addCheckbox(
       "Show chunk statistics",
@@ -125,7 +129,10 @@ export class ViewerSettingsPanel extends SidePanel {
     );
     addCheckbox("Wire frame rendering", viewer.wireFrame);
     addCheckbox("Enable prefetching", viewer.chunkQueueManager.enablePrefetch);
-    addCheckbox("Enable adaptive downsampling", viewer.enableAdaptiveDownsampling);
+    addCheckbox(
+      "Enable adaptive downsampling",
+      viewer.enableAdaptiveDownsampling,
+    );
 
     const addColor = (label: string, value: WatchableValueInterface<vec3>) => {
       const labelElement = document.createElement("label");

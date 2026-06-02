@@ -15,6 +15,7 @@
  */
 
 import { decodeJpeg } from "#src/async_computation/decode_jpeg_request.js";
+import { decodePng } from "#src/async_computation/decode_png_request.js";
 import { requestAsyncComputation } from "#src/async_computation/request.js";
 import { WithParameters } from "#src/chunk_manager/backend.js";
 import { TileChunkSourceParameters } from "#src/datasource/render/base.js";
@@ -23,39 +24,70 @@ import { postProcessRawData } from "#src/sliceview/backend_chunk_decoders/postpr
 import { decodeRawChunk } from "#src/sliceview/backend_chunk_decoders/raw.js";
 import type { VolumeChunk } from "#src/sliceview/volume/backend.js";
 import { VolumeChunkSource } from "#src/sliceview/volume/backend.js";
-import type { CancellationToken } from "#src/util/cancellation.js";
 import { Endianness } from "#src/util/endian.js";
 import { vec3 } from "#src/util/geom.js";
-import {
-  cancellableFetchOk,
-  responseArrayBuffer,
-} from "#src/util/http_request.js";
+import { fetchOk } from "#src/util/http_request.js";
 import { registerSharedObject } from "#src/worker_rpc.js";
 
 const chunkDecoders = new Map<string, ChunkDecoder>();
 chunkDecoders.set(
   "jpg",
-  async (
-    chunk: VolumeChunk,
-    cancellationToken: CancellationToken,
-    response: ArrayBuffer,
-  ) => {
+  async (chunk: VolumeChunk, signal: AbortSignal, response: ArrayBuffer) => {
     const chunkDataSize = chunk.chunkDataSize!;
     const { uint8Array: decoded } = await requestAsyncComputation(
       decodeJpeg,
-      cancellationToken,
+      signal,
       [response],
       new Uint8Array(response),
-      chunkDataSize[0],
-      chunkDataSize[1] * chunkDataSize[2],
+      undefined,
+      undefined,
+      chunkDataSize[0] * chunkDataSize[1] * chunkDataSize[2],
       3,
       true,
     );
-    await postProcessRawData(chunk, cancellationToken, decoded);
+    await postProcessRawData(chunk, signal, decoded);
   },
 );
-chunkDecoders.set("raw16", (chunk, cancellationToken, response) => {
-  return decodeRawChunk(chunk, cancellationToken, response, Endianness.BIG);
+chunkDecoders.set(
+  "png",
+  async (chunk: VolumeChunk, signal: AbortSignal, response: ArrayBuffer) => {
+    const chunkDataSize = chunk.chunkDataSize!;
+    const { uint8Array: decoded } = await requestAsyncComputation(
+      decodePng,
+      signal,
+      [response],
+      new Uint8Array(response),
+      chunkDataSize[0],
+      chunkDataSize[1],
+      chunkDataSize[0] * chunkDataSize[1] * chunkDataSize[2],
+      4,
+      1,
+      false,
+    );
+    await postProcessRawData(chunk, signal, decoded);
+  },
+);
+chunkDecoders.set(
+  "png16",
+  async (chunk: VolumeChunk, signal: AbortSignal, response: ArrayBuffer) => {
+    const chunkDataSize = chunk.chunkDataSize!;
+    const { uint8Array: decoded } = await requestAsyncComputation(
+      decodePng,
+      signal,
+      [response],
+      new Uint8Array(response),
+      chunkDataSize[0],
+      chunkDataSize[1],
+      chunkDataSize[0] * chunkDataSize[1] * chunkDataSize[2],
+      1,
+      2,
+      false,
+    );
+    await postProcessRawData(chunk, signal, decoded);
+  },
+);
+chunkDecoders.set("raw16", (chunk, signal, response) => {
+  return decodeRawChunk(chunk, signal, response, Endianness.BIG);
 });
 
 @registerSharedObject()
@@ -67,34 +99,21 @@ export class TileChunkSource extends WithParameters(
 
   queryString = (() => {
     const { parameters } = this;
-    const query_params: string[] = [];
+    const query_params = new URLSearchParams();
+
     if (parameters.channel !== undefined) {
-      query_params.push("channels=" + parameters.channel);
+      query_params.append("channel", parameters.channel);
     }
-    if (parameters.minIntensity !== undefined) {
-      query_params.push(
-        `minIntensity=${JSON.stringify(parameters.minIntensity)}`,
-      );
+
+    // Parse fallback key-value argument
+    for (const [key, value] of Object.entries(parameters.renderArgs)) {
+      query_params.append(key, value);
     }
-    if (parameters.maxIntensity !== undefined) {
-      query_params.push(
-        `maxIntensity=${JSON.stringify(parameters.maxIntensity)}`,
-      );
-    }
-    if (parameters.maxTileSpecsToRender !== undefined) {
-      query_params.push(
-        `maxTileSpecsToRender=${JSON.stringify(
-          parameters.maxTileSpecsToRender,
-        )}`,
-      );
-    }
-    if (parameters.filter !== undefined) {
-      query_params.push(`filter=${JSON.stringify(parameters.filter)}`);
-    }
-    return query_params.join("&");
+
+    return query_params.toString();
   })();
 
-  async download(chunk: VolumeChunk, cancellationToken: CancellationToken) {
+  async download(chunk: VolumeChunk, signal: AbortSignal) {
     const { parameters } = this;
     const { chunkGridPosition } = chunk;
 
@@ -119,16 +138,18 @@ export class TileChunkSource extends WithParameters(
     let imageMethod: string;
     if (parameters.encoding === "raw16") {
       imageMethod = "raw16-image";
+    } else if (parameters.encoding === "png16") {
+      imageMethod = "png16-image";
+    } else if (parameters.encoding === "png") {
+      imageMethod = "png-image";
     } else {
       imageMethod = "jpeg-image";
     }
     const path = `/render-ws/v1/owner/${parameters.owner}/project/${parameters.project}/stack/${parameters.stack}/z/${chunkPosition[2]}/box/${chunkPosition[0]},${chunkPosition[1]},${xTileSize},${yTileSize},${scale}/${imageMethod}`;
-    const response = await cancellableFetchOk(
+    const response = await fetchOk(
       `${parameters.baseUrl}${path}?${this.queryString}`,
-      {},
-      responseArrayBuffer,
-      cancellationToken,
+      { signal: signal },
     );
-    await this.chunkDecoder(chunk, cancellationToken, response);
+    await this.chunkDecoder(chunk, signal, await response.arrayBuffer());
   }
 }

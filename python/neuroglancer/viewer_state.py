@@ -13,11 +13,14 @@
 # limitations under the License.
 """Wrappers for representing the Neuroglancer viewer state."""
 
+from __future__ import annotations
+
 import collections
 import collections.abc
 import copy
 import math
 import numbers
+import os
 import re
 import typing
 
@@ -29,19 +32,22 @@ from .equivalence_map import EquivalenceMap
 from .json_utils import encode_json_for_repr
 from .json_wrappers import (
     JsonObjectWrapper,
-    TypedList,
-    TypedStringMap,
+    List,
+    Map,
+    _set_type_annotation,
     array_wrapper,
     bool_or_string,
     number_or_string,
+    number_or_string_or_array,
     optional,
-    text_type,
     typed_list,
     typed_map,
     typed_set,
-    typed_string_map,
     wrapped_property,
 )
+
+_BUILDING_DOCS = os.environ.get("NEUROGLANCER_BUILDING_DOCS") == "1"
+
 
 __all__ = ["CoordinateSpace", "DimensionScale", "CoordinateArray"]
 
@@ -49,6 +55,9 @@ __all__ = ["CoordinateSpace", "DimensionScale", "CoordinateArray"]
 def export(obj):
     __all__.append(obj.__name__)
     return obj
+
+
+T = typing.TypeVar("T")
 
 
 def interpolate_linear(a, b, t):
@@ -65,7 +74,9 @@ def unit_quaternion():
     return np.array([0, 0, 0, 1], np.float32)
 
 
-def quaternion_slerp(a, b, t):
+def quaternion_slerp(
+    a: np.ndarray | None, b: np.ndarray | None, t: float
+) -> np.ndarray:
     """Spherical linear interpolation for unit quaternions.
 
     This is based on the implementation in the gl-matrix package:
@@ -97,18 +108,31 @@ def quaternion_slerp(a, b, t):
     return scale0 * a + scale1 * b
 
 
-def interpolate_zoom(a, b, t):
+def interpolate_zoom(a: float | None, b: float | None, t: float) -> float | None:
     if a is None or b is None:
         return a
     scale_change = math.log(b / a)
     return a * math.exp(scale_change * t)
 
 
+class _ToolMetaclass(type):
+    def __call__(self, obj: typing.Any = None, _readonly: bool = False, **kwargs):
+        return _factory_new(
+            registry=tool_types,
+            base_class=Tool,
+            cls=self,
+            allow_str=True,
+            obj=obj,
+            _readonly=_readonly,
+            kwargs=kwargs,
+        )
+
+
 @export
-class Tool(JsonObjectWrapper):
+class Tool(JsonObjectWrapper, metaclass=_ToolMetaclass):
     __slots__ = ()
 
-    type = wrapped_property("type", text_type)
+    type = wrapped_property("type", str)
 
     TOOL_TYPE: str
 
@@ -118,6 +142,10 @@ class Tool(JsonObjectWrapper):
             kwargs.update(type=tool_type)
         super().__init__(*args, **kwargs)
 
+    def __new__(cls, json_data=None, _readonly: bool = False, **kwargs):
+        """Coerces the argument to a `Tool`."""
+        return object.__new__(cls)
+
 
 tool_types = {}
 
@@ -126,6 +154,17 @@ def export_tool(tool_class):
     export(tool_class)
     tool_types[tool_class.TOOL_TYPE] = tool_class
     return tool_class
+
+
+@export
+class LayerTool(Tool):
+    __slots__ = ()
+
+    layer = wrapped_property("layer", optional(str))
+    """Name of the layer to which this tool applies.
+
+    Only valid for tools contained within `~ToolPalette.tools`.
+    """
 
 
 @export_tool
@@ -153,190 +192,178 @@ class PlaceEllipsoidTool(Tool):
 
 
 @export_tool
-class BlendTool(Tool):
+class PlacePolylineTool(Tool):
+    __slots__ = ()
+    TOOL_TYPE = "annotatePolyline"
+
+
+@export_tool
+class BlendTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "blend"
 
 
 @export_tool
-class OpacityTool(Tool):
+class OpacityTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "opacity"
 
 
 @export_tool
-class VolumeRenderingTool(Tool):
+class VolumeRenderingTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "volumeRendering"
 
 
 @export_tool
-class VolumeRenderingGainTool(Tool):
+class VolumeRenderingGainTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "volumeRenderingGain"
 
 
 @export_tool
-class VolumeRenderingDepthSamplesTool(Tool):
+class VolumeRenderingDepthSamplesTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "volumeRenderingDepthSamples"
 
 
 @export_tool
-class CrossSectionRenderScaleTool(Tool):
+class CrossSectionRenderScaleTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "crossSectionRenderScale"
 
 
 @export_tool
-class SelectedAlphaTool(Tool):
+class SelectedAlphaTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "selectedAlpha"
 
 
 @export_tool
-class NotSelectedAlphaTool(Tool):
+class NotSelectedAlphaTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "notSelectedAlpha"
 
 
 @export_tool
-class ObjectAlphaTool(Tool):
+class ObjectAlphaTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "objectAlpha"
 
 
 @export_tool
-class HideSegmentZeroTool(Tool):
+class HideSegmentZeroTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "hideSegmentZero"
 
 
 @export_tool
-class HoverHighlightTool(Tool):
+class HoverHighlightTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "hoverHighlight"
 
 
 @export_tool
-class BaseSegmentColoringTool(Tool):
+class BaseSegmentColoringTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "baseSegmentColoring"
 
 
 @export_tool
-class IgnoreNullVisibleSetTool(Tool):
+class IgnoreNullVisibleSetTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "ignoreNullVisibleSet"
 
 
 @export_tool
-class ColorSeedTool(Tool):
+class ColorSeedTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "colorSeed"
 
 
 @export_tool
-class SegmentDefaultColorTool(Tool):
+class SegmentDefaultColorTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "segmentDefaultColor"
 
 
 @export_tool
-class MeshRenderScaleTool(Tool):
+class MeshRenderScaleTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "meshRenderScale"
 
 
 @export_tool
-class MeshSilhouetteRenderingTool(Tool):
+class MeshSilhouetteRenderingTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "meshSilhouetteRendering"
 
 
 @export_tool
-class SaturationTool(Tool):
+class SaturationTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "saturation"
 
 
 @export_tool
-class SkeletonRenderingMode2dTool(Tool):
+class SkeletonRenderingMode2dTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "skeletonRendering.mode2d"
 
 
 @export_tool
-class SkeletonRenderingMode3dTool(Tool):
+class SkeletonRenderingMode3dTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "skeletonRendering.mode3d"
 
 
 @export_tool
-class SkeletonRenderingLineWidth2dTool(Tool):
+class SkeletonRenderingLineWidth2dTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "skeletonRendering.lineWidth2d"
 
 
 @export_tool
-class SkeletonRenderingLineWidth3dTool(Tool):
+class SkeletonRenderingLineWidth3dTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "skeletonRendering.lineWidth3d"
 
 
 @export_tool
-class ShaderControlTool(Tool):
+class ShaderControlTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "shaderControl"
-    control = wrapped_property("control", text_type)
+    control = wrapped_property("control", str)
 
 
 @export_tool
-class MergeSegmentsTool(Tool):
+class MergeSegmentsTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "mergeSegments"
 
 
 @export_tool
-class SplitSegmentsTool(Tool):
+class SplitSegmentsTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "splitSegments"
 
 
 @export_tool
-class SelectSegmentsTool(Tool):
+class SelectSegmentsTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "selectSegments"
 
 
 @export_tool
-class DimensionTool(Tool):
+class DimensionTool(LayerTool):
     __slots__ = ()
     TOOL_TYPE = "dimension"
-    dimension = wrapped_property("dimension", text_type)
-
-
-@export
-def tool(json_data, _readonly=False):
-    if isinstance(json_data, Tool):
-        return json_data
-    if isinstance(json_data, str):
-        json_data = {"type": json_data}
-    if not isinstance(json_data, dict):
-        raise TypeError
-
-    type_name = json_data.get("type")
-    tool_type = tool_types.get(type_name)
-    if tool_type is None:
-        raise ValueError
-    return tool_type(json_data, _readonly=_readonly)
-
-
-tool.supports_readonly = True
+    dimension = wrapped_property("dimension", str)
 
 
 @export
 class SidePanelLocation(JsonObjectWrapper):
+    __slots__ = ()
     side = wrapped_property("side", optional(str))
     visible = wrapped_property("visible", optional(bool))
     size = wrapped_property("size", optional(int))
@@ -346,8 +373,16 @@ class SidePanelLocation(JsonObjectWrapper):
 
 
 @export
+class ToolPalette(SidePanelLocation):
+    __slots__ = ()
+    tools = wrapped_property("tools", typed_list(Tool))
+    query = wrapped_property("query", optional(str))
+
+
+@export
 class SelectedLayerState(SidePanelLocation):
-    layer = wrapped_property("layer", optional(text_type))
+    __slots__ = ()
+    layer = wrapped_property("layer", optional(str))
 
 
 @export
@@ -384,25 +419,24 @@ class DimensionPlaybackVelocity(JsonObjectWrapper):
 @export
 class Layer(JsonObjectWrapper):
     __slots__ = ()
-    type = wrapped_property("type", optional(text_type))
-    layer_dimensions = layerDimensions = wrapped_property(
+    type = wrapped_property("type", optional(str))
+    local_dimensions = localDimensions = wrapped_property(
         "localDimensions", CoordinateSpace
     )
-    layer_position = layerPosition = local_position = localPosition = wrapped_property(
+    local_position = localPosition = wrapped_property(
         "localPosition", optional(array_wrapper(np.float32))
     )
-    localVelocity = local_velocity = wrapped_property(
-        "localVelocity",
-        typed_map(key_type=text_type, value_type=DimensionPlaybackVelocity),
+    local_velocity = localVelocity = wrapped_property(
+        "localVelocity", typed_map(key_type=str, value_type=DimensionPlaybackVelocity)
     )
 
     tab = wrapped_property("tab", optional(str))
     panels = wrapped_property("panels", typed_list(LayerSidePanelState))
     pick = wrapped_property("pick", optional(bool))
     tool_bindings = wrapped_property(
-        "toolBindings", typed_map(key_type=text_type, value_type=tool)
+        "toolBindings", typed_map(key_type=str, value_type=Tool)
     )
-    tool = wrapped_property("tool", optional(tool))
+    tool = wrapped_property("tool", optional(Tool))
 
     @staticmethod
     def interpolate(a, b, t):
@@ -438,11 +472,11 @@ class CoordinateSpaceTransform(JsonObjectWrapper):
 
 
 def data_source_url(x):
-    if isinstance(x, (local_volume.LocalVolume, skeleton.SkeletonSource)):
+    if isinstance(x, local_volume.LocalVolume | skeleton.SkeletonSource):
         return x
     if not isinstance(x, str):
         raise TypeError
-    return text_type(x)
+    return x
 
 
 @export
@@ -464,21 +498,21 @@ class LayerDataSource(JsonObjectWrapper):
 
     def __init__(self, json_data=None, *args, **kwargs):
         if isinstance(json_data, str) or isinstance(
-            json_data, (local_volume.LocalVolume, skeleton.SkeletonSource)
+            json_data, local_volume.LocalVolume | skeleton.SkeletonSource
         ):
             json_data = {"url": json_data}
         super().__init__(json_data, *args, **kwargs)
 
     url = wrapped_property("url", data_source_url)
     transform = wrapped_property("transform", optional(CoordinateSpaceTransform))
-    subsources = wrapped_property("subsources", typed_string_map(LayerDataSubsource))
+    subsources = wrapped_property("subsources", typed_map(str, LayerDataSubsource))
     enable_default_subsources = enableDefaultSubsources = wrapped_property(
         "enableDefaultSubsources", optional(bool, True)
     )
 
 
-if typing.TYPE_CHECKING:
-    _LayerDataSourcesBase = TypedList[LayerDataSource]
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
+    _LayerDataSourcesBase = List[LayerDataSource]
 else:
     _LayerDataSourcesBase = typed_list(LayerDataSource, validator=LayerDataSource)
 
@@ -490,13 +524,11 @@ class LayerDataSources(_LayerDataSourcesBase):
     def __init__(self, json_data=None, **kwargs):
         if isinstance(
             json_data,
-            (
-                LayerDataSource,
-                str,
-                local_volume.LocalVolume,
-                skeleton.SkeletonSource,
-                dict,
-            ),
+            LayerDataSource
+            | str
+            | local_volume.LocalVolume
+            | skeleton.SkeletonSource
+            | dict,
         ):
             json_data = [json_data]
         elif isinstance(json_data, LayerDataSources):
@@ -507,7 +539,7 @@ class LayerDataSources(_LayerDataSourcesBase):
 class _AnnotationLayerOptions:
     __slots__ = ()
     annotation_color = annotationColor = wrapped_property(
-        "annotationColor", optional(text_type)
+        "annotationColor", optional(str)
     )
 
 
@@ -550,9 +582,15 @@ def _shader_control_parameters(v, _readonly=False):
     raise TypeError(f"Unexpected shader control parameters type: {type(v)}")
 
 
+_set_type_annotation(
+    _shader_control_parameters,
+    numbers.Number | str | InvlerpParameters | TransferFunctionParameters,
+)
+
+
 _shader_control_parameters.supports_readonly = True  # type: ignore[attr-defined]
 
-ShaderControls = typed_string_map(_shader_control_parameters)
+ShaderControls = typed_map(str, _shader_control_parameters)
 
 
 @export
@@ -563,7 +601,7 @@ class ImageLayer(Layer, _AnnotationLayerOptions):
         super().__init__(*args, type="image", **kwargs)
 
     source = wrapped_property("source", LayerDataSources)
-    shader = wrapped_property("shader", text_type)
+    shader = wrapped_property("shader", str)
     shader_controls = shaderControls = wrapped_property(
         "shaderControls", ShaderControls
     )
@@ -609,13 +647,13 @@ def _linked_segmentation_color_group_value(x):
 class SkeletonRenderingOptions(JsonObjectWrapper):
     __slots__ = ()
 
-    shader = wrapped_property("shader", optional(text_type))
+    shader = wrapped_property("shader", optional(str))
     shader_controls = shaderControls = wrapped_property(
         "shaderControls", ShaderControls
     )
-    mode2d = wrapped_property("mode2d", optional(text_type))
+    mode2d = wrapped_property("mode2d", optional(str))
     line_width2d = lineWidth2d = wrapped_property("lineWidth2d", optional(float, 2))
-    mode3d = wrapped_property("mode3d", optional(text_type))
+    mode3d = wrapped_property("mode3d", optional(str))
     line_width3d = lineWidth3d = wrapped_property("lineWidth3d", optional(float, 1))
 
 
@@ -686,50 +724,81 @@ class StarredSegments(collections.abc.MutableMapping[int, bool]):
                 visible.pop(k, None)
 
     def copy(self):
+        """Returns a copy of the starred segment list."""
         return StarredSegments(self)
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Returns the number of starred segments."""
         return len(self._data)
 
-    def __contains__(self, segment_id) -> bool:
+    def __contains__(self, segment_id: typing.Any) -> bool:
+        """Checks if a segment is starred."""
         return segment_id in self._data
 
-    def keys(self):
+    def keys(self) -> collections.abc.KeysView[int]:
+        """Returns a view of the starred segments."""
         return self._data.keys()
 
-    def values(self):
+    def values(self) -> collections.abc.ValuesView[bool]:
+        """Returns a view of the visibility state of each starred segment."""
         return self._data.values()
 
-    def items(self):
+    def items(self) -> collections.abc.ItemsView[int, bool]:
+        """Returns a view of the (segment, visible) pairs."""
         return self._data.items()
 
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         if isinstance(other, StarredSegments):
             return self._data == other._data
         return self._data == other
 
     def add(self, segment_id: int) -> None:
+        """Adds a starred segment, marking it visible if not already starred."""
         if self._readonly:
             raise AttributeError
         self.setdefault(segment_id, True)
 
-    def get(self, segment_id: int, default_value=None) -> bool:
-        return self._data.get(segment_id, default_value)
+    @typing.overload
+    def get(self, segment_id: int) -> bool | None: ...
+
+    @typing.overload
+    def get(self, segment_id: int, default: T) -> bool | T: ...
+
+    def get(self, segment_id: int, default=None):
+        """Checks if a segment is visible.
+
+        Args:
+          segment_id: Segment to check.
+          default: Return value if :py:param:`.segment_id` is not starred.
+
+        Returns:
+          `True` if visible, `False` if starred but not visible,
+          :py:param:`.default` if not starred.
+        """
+        return self._data.get(segment_id, default)
 
     def __getitem__(self, segment_id: int) -> bool:
+        """Checks if a starred segment is visible."""
         return self._data[segment_id]
 
     def remove(self, segment_id: int) -> None:
+        """Removes a segment from the starred list.
+
+        Raises:
+          KeyError: if the segment is not starred.
+        """
         if self._readonly:
             raise AttributeError
         del self._data[segment_id]
         self._visible.pop(segment_id)
 
     def discard(self, segment_id: int) -> None:
+        """Removes a segment from the starred list if present."""
         self._data.pop(segment_id, None)
         self._visible.pop(segment_id, None)
 
     def __setitem__(self, segment_id: int, visible: bool) -> None:
+        """Stars and sets the visibility of a segment."""
         if self._readonly:
             raise AttributeError
         self._data[segment_id] = visible
@@ -739,12 +808,18 @@ class StarredSegments(collections.abc.MutableMapping[int, bool]):
             self._visible.pop(segment_id, None)
 
     def __delitem__(self, segment_id: int) -> None:
+        """Removes a segment from the starred list.
+
+        Raises:
+          KeyError: if the segment is not starred.
+        """
         if self._readonly:
             raise AttributeError
         del self._data[segment_id]
         self._visible.pop(segment_id, None)
 
     def clear(self):
+        """Unstars all segments."""
         if self._readonly:
             raise AttributeError
         self._data.clear()
@@ -753,22 +828,29 @@ class StarredSegments(collections.abc.MutableMapping[int, bool]):
     def __repr__(self):
         return f"StarredSegments({self._data!r})"
 
-    def update(self, other):
+    def update(  # type: ignore[override]
+        self,
+        other: StarredSegments
+        | collections.abc.MutableMapping[int, bool]
+        | typing.Iterable[int | str | tuple[int, bool]],
+    ):
+        """Merges in additional starred segments."""
         if self._readonly:
             raise AttributeError
         self._update(other)
 
-    def to_json(self):
+    def to_json(self) -> list[str]:
+        """Returns the representation as a list of strings."""
         return [
             f"{segment}" if visible else f"!{segment}"
             for segment, visible in self.items()
         ]
 
-    def __iter__(self):
+    def __iter__(self) -> typing.Iterator[int]:
         return iter(self._data)
 
     @property
-    def visible(self):
+    def visible(self) -> VisibleSegments:
         return VisibleSegments(self)
 
     @visible.setter
@@ -785,29 +867,39 @@ class StarredSegments(collections.abc.MutableMapping[int, bool]):
 
 @export
 class VisibleSegments(collections.abc.MutableSet[int]):
+    """Subset of visible segments within a `StarredSegments` object."""
+
     def __init__(self, starred_segments: StarredSegments):
+        """Constructs a view of the visible segments within a ``StarredSegments`` object."""
         self._starred_segments = starred_segments
         self._visible = self._starred_segments._visible
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Returns the number of visible segments."""
         return len(self._visible)
 
     def clear(self):
+        """Unstars all segments."""
         self._starred_segments.clear()
 
-    def __contains__(self, segment_id):
+    def __contains__(self, segment_id: typing.Any) -> bool:
+        """Checks if a segment is visible."""
         return segment_id in self._visible
 
     def add(self, segment_id: int) -> None:
+        """Stars a segment and marks it visible."""
         self._starred_segments[segment_id] = True
 
     def discard(self, segment_id) -> None:
+        """Unstars a segment if present."""
         self._starred_segments.discard(segment_id)
 
-    def __iter__(self):
+    def __iter__(self) -> typing.Iterator[int]:
+        """Iterates over the visible segments."""
         return iter(self._visible)
 
-    def copy(self):
+    def copy(self) -> VisibleSegments:
+        """Returns a copy of the visible segment list."""
         new_starred_segments = StarredSegments()
         new_visible = self._visible.copy()
         new_starred_segments._data = new_visible
@@ -883,12 +975,12 @@ class SegmentationLayer(Layer, _AnnotationLayerOptions):
     mesh_silhouette_rendering = meshSilhouetteRendering = wrapped_property(
         "meshSilhouetteRendering", optional(float, 0)
     )
-    segment_query = segmentQuery = wrapped_property("segmentQuery", optional(text_type))
+    segment_query = segmentQuery = wrapped_property("segmentQuery", optional(str))
     segment_colors = segmentColors = wrapped_property(
-        "segmentColors", typed_map(key_type=np.uint64, value_type=text_type)
+        "segmentColors", typed_map(key_type=np.uint64, value_type=str)
     )
     segment_default_color = segmentDefaultColor = wrapped_property(
-        "segmentDefaultColor", optional(text_type)
+        "segmentDefaultColor", optional(str)
     )
 
     @property
@@ -906,7 +998,7 @@ class SegmentationLayer(Layer, _AnnotationLayerOptions):
         return d
 
     linked_segmentation_group = linkedSegmentationGroup = wrapped_property(
-        "linkedSegmentationGroup", optional(text_type)
+        "linkedSegmentationGroup", optional(str)
     )
     linked_segmentation_color_group = linkedSegmentationColorGroup = wrapped_property(
         "linkedSegmentationColorGroup", optional(_linked_segmentation_color_group_value)
@@ -929,26 +1021,67 @@ class SingleMeshLayer(Layer):
 
     source = wrapped_property("source", LayerDataSources)
     vertex_attribute_sources = vertexAttributeSources = wrapped_property(
-        "vertexAttributeSources", optional(typed_list(text_type))
+        "vertexAttributeSources", optional(typed_list(str))
     )
-    shader = wrapped_property("shader", text_type)
+    shader = wrapped_property("shader", str)
     vertex_attribute_names = vertexAttributeNames = wrapped_property(
-        "vertexAttributeNames", optional(typed_list(optional(text_type)))
+        "vertexAttributeNames", optional(typed_list(optional(str)))
     )
 
 
-class AnnotationBase(JsonObjectWrapper):
+def _factory_new(
+    registry: collections.abc.Mapping[str, type],
+    base_class: type,
+    cls: type,
+    allow_str: bool,
+    obj: typing.Any,
+    _readonly: bool,
+    kwargs,
+):
+    if cls is base_class:
+        if isinstance(obj, base_class):
+            cls = type(obj)
+        else:
+            if allow_str and isinstance(obj, str):
+                t = obj
+                obj = {"type": obj}
+            else:
+                if not isinstance(obj, dict):
+                    raise TypeError("Expected dict", obj)
+                t = obj.get("type")  # type: ignore[assignment]
+            cls = registry[t]  # type: ignore[index]
+    return type.__call__(cls, obj, _readonly=_readonly, **kwargs)
+
+
+class _AnnotationMetaclass(type):
+    def __call__(self, obj: typing.Any = None, _readonly: bool = False, **kwargs):
+        return _factory_new(
+            registry=annotation_types,
+            base_class=Annotation,
+            cls=self,
+            allow_str=False,
+            obj=obj,
+            _readonly=_readonly,
+            kwargs=kwargs,
+        )
+
+
+class Annotation(JsonObjectWrapper, metaclass=_AnnotationMetaclass):
     __slots__ = ()
 
-    id = wrapped_property("id", optional(text_type))  # pylint: disable=invalid-name
-    type = wrapped_property("type", text_type)
-    description = wrapped_property("description", optional(text_type))
+    id = wrapped_property("id", optional(str))  # pylint: disable=invalid-name
+    type = wrapped_property("type", str)
+    description = wrapped_property("description", optional(str))
     segments = wrapped_property("segments", optional(typed_list(typed_list(np.uint64))))
-    props = wrapped_property("props", optional(typed_list(number_or_string)))
+    props = wrapped_property("props", typed_list(number_or_string_or_array))
+
+    def __new__(cls, obj=None, _readonly: bool = False, **kwargs):
+        """Coerces the argument to an `Annotation`."""
+        return object.__new__(cls)
 
 
 @export
-class PointAnnotation(AnnotationBase):
+class PointAnnotation(Annotation):
     __slots__ = ()
 
     def __init__(self, *args, **kwargs):
@@ -958,7 +1091,7 @@ class PointAnnotation(AnnotationBase):
 
 
 @export
-class LineAnnotation(AnnotationBase):
+class LineAnnotation(Annotation):
     __slots__ = ()
 
     def __init__(self, *args, **kwargs):
@@ -969,7 +1102,17 @@ class LineAnnotation(AnnotationBase):
 
 
 @export
-class AxisAlignedBoundingBoxAnnotation(AnnotationBase):
+class PolyLineAnnotation(Annotation):
+    __slots__ = ()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, type="polyline", **kwargs)
+
+    points = wrapped_property("points", typed_list(typed_list(number_or_string)))
+
+
+@export
+class AxisAlignedBoundingBoxAnnotation(Annotation):
     __slots__ = ()
 
     def __init__(self, *args, **kwargs):
@@ -980,7 +1123,7 @@ class AxisAlignedBoundingBoxAnnotation(AnnotationBase):
 
 
 @export
-class EllipsoidAnnotation(AnnotationBase):
+class EllipsoidAnnotation(Annotation):
     __slots__ = ()
 
     def __init__(self, *args, **kwargs):
@@ -995,32 +1138,21 @@ annotation_types = {
     "line": LineAnnotation,
     "axis_aligned_bounding_box": AxisAlignedBoundingBoxAnnotation,
     "ellipsoid": EllipsoidAnnotation,
+    "polyline": PolyLineAnnotation,
 }
-
-
-def annotation(obj, _readonly=False):
-    if isinstance(obj, AnnotationBase):
-        obj = obj.to_json()
-    elif not isinstance(obj, dict):
-        raise TypeError
-    t = obj.get("type")
-    return annotation_types[t](obj, _readonly=_readonly)
-
-
-annotation.supports_readonly = True  # type: ignore[attr-defined]
 
 
 @export
 class AnnotationPropertySpec(JsonObjectWrapper):
     __slots__ = ()
-    id = wrapped_property("id", text_type)
-    type = wrapped_property("type", text_type)
-    description = wrapped_property("description", optional(text_type))
+    id = wrapped_property("id", str)
+    type = wrapped_property("type", str)
+    description = wrapped_property("description", optional(str))
     default = wrapped_property("default", optional(number_or_string))
     enum_values = wrapped_property(
         "enum_values", optional(typed_list(number_or_string))
     )
-    enum_labels = wrapped_property("enum_labels", optional(typed_list(text_type)))
+    enum_labels = wrapped_property("enum_labels", optional(typed_list(str)))
 
 
 @export
@@ -1031,23 +1163,23 @@ class AnnotationLayer(Layer, _AnnotationLayerOptions):
         super().__init__(*args, type="annotation", **kwargs)
 
     source = wrapped_property("source", LayerDataSources)
-    annotations = wrapped_property("annotations", typed_list(annotation))
+    annotations = wrapped_property("annotations", typed_list(Annotation))
     annotation_properties = annotationProperties = wrapped_property(
         "annotationProperties", typed_list(AnnotationPropertySpec)
     )
     annotation_relationships = annotationRelationships = wrapped_property(
-        "annotationRelationships", typed_list(text_type)
+        "annotationRelationships", typed_list(str)
     )
     linked_segmentation_layer = linkedSegmentationLayer = wrapped_property(
-        "linkedSegmentationLayer", typed_string_map(text_type)
+        "linkedSegmentationLayer", typed_map(str, str)
     )
     filter_by_segmentation = filterBySegmentation = wrapped_property(
-        "filterBySegmentation", typed_list(text_type)
+        "filterBySegmentation", typed_list(str)
     )
     ignore_null_segment_filter = ignoreNullSegmentFilter = wrapped_property(
         "ignoreNullSegmentFilter", optional(bool, True)
     )
-    shader = wrapped_property("shader", text_type)
+    shader = wrapped_property("shader", str)
     shader_controls = shaderControls = wrapped_property(
         "shaderControls", ShaderControls
     )
@@ -1178,11 +1310,11 @@ class Layers:
     __slots__ = ("_layers", "_readonly")
     supports_readonly = True
 
-    def __init__(self, json_data, _readonly=False):
+    def __init__(self, json_data: typing.Any, _readonly: bool = False) -> None:
         if json_data is None:
             json_data = {}
-        self._layers = []
-        self._readonly = _readonly
+        self._layers: list[ManagedLayer] = []
+        self._readonly: bool = _readonly
         if isinstance(json_data, collections.abc.Mapping):
             for k, v in json_data.items():
                 self._layers.append(ManagedLayer(k, v, _readonly=_readonly))
@@ -1195,29 +1327,52 @@ class Layers:
                     )
                 elif isinstance(layer, dict):
                     self._layers.append(
-                        ManagedLayer(
-                            text_type(layer["name"]), layer, _readonly=_readonly
-                        )
+                        ManagedLayer(str(layer["name"]), layer, _readonly=_readonly)
                     )
                 else:
                     raise TypeError
 
-    def index(self, k):
+    def index(self, k: str) -> int:
         for i, u in enumerate(self._layers):
             if u.name == k:
                 return i
         return -1
 
-    def __contains__(self, k):
+    def __contains__(self, k: str) -> int:
         return self.index(k) != -1
 
-    def __getitem__(self, k):
-        """Indexes into the list of layers by index, slice, or layer name."""
-        if isinstance(k, str):
-            return self._layers[self.index(k)]
-        return self._layers[k]
+    @typing.overload
+    def __getitem__(self, k: str | int) -> ManagedLayer: ...
 
-    def __setitem__(self, k, v):
+    @typing.overload
+    def __getitem__(self, k: slice) -> Layers: ...
+
+    def __getitem__(self, k: str | int | slice) -> ManagedLayer | Layers:
+        """Indexes into the list of layers by index, slice, or layer name."""
+        match k:
+            case str():
+                return self._layers[self.index(k)]
+            case slice():
+                return Layers(self._layers[k])
+            case _:
+                return self._layers[k]
+
+    @typing.overload
+    def __setitem__(self, k: str, v: Layer | ManagedLayer) -> None: ...
+
+    @typing.overload
+    def __setitem__(self, k: int, v: ManagedLayer) -> None: ...
+
+    @typing.overload
+    def __setitem__(
+        self, k: slice, v: collections.abc.Iterable[ManagedLayer]
+    ) -> None: ...
+
+    def __setitem__(
+        self,
+        k: str | int | slice,
+        v: Layer | ManagedLayer | collections.abc.Iterable[ManagedLayer],
+    ) -> None:
         if self._readonly:
             raise AttributeError
         if isinstance(k, str):
@@ -1233,7 +1388,7 @@ class Layers:
         else:
             if isinstance(k, slice):
                 values = []
-                for x in v:
+                for x in typing.cast(collections.abc.Iterable[ManagedLayer], v):
                     if not isinstance(v, ManagedLayer):
                         raise TypeError
                     values.append(x)
@@ -1243,11 +1398,11 @@ class Layers:
                     raise TypeError
                 self._layers[k] = v
 
-    def clear(self):
+    def clear(self) -> None:
         """Clears the list of layers."""
         del self[:]
 
-    def __delitem__(self, k):
+    def __delitem__(self, k: str | int | slice) -> None:
         """Deletes a layer by index, slice, or name."""
         if self._readonly:
             raise AttributeError
@@ -1269,11 +1424,11 @@ class Layers:
         for element in elements:
             self.append(element)
 
-    def __len__(self):
+    def __len__(self) -> int:
         """Returns the number of layers in the list."""
         return len(self._layers)
 
-    def __iter__(self):
+    def __iter__(self) -> collections.abc.Iterator[ManagedLayer]:
         return iter(self._layers)
 
     def to_json(self):
@@ -1282,18 +1437,18 @@ class Layers:
             r.append(x.to_json())
         return r
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return repr(self._layers)
 
     @staticmethod
-    def interpolate(a, b, t):
+    def interpolate(a: Layers, b: Layers, t: float) -> Layers:
         c = copy.deepcopy(a)
         for layer in c:
             index = b.index(layer.name)
             if index == -1:
                 continue
             other_layer = b[index]
-            if type(other_layer.layer) is not type(layer.layer):  # pylint: disable=unidiomatic-typecheck  # noqa: E721
+            if type(other_layer.layer) is not type(layer.layer):  # noqa: E721
                 continue
             layer.layer = type(layer.layer).interpolate(
                 layer.layer, other_layer.layer, t
@@ -1309,15 +1464,28 @@ def navigation_link_type(x):
     return x
 
 
-_T = typing.TypeVar("_T")
+_set_type_annotation(
+    navigation_link_type, typing.Literal["linked", "unlinked", "relative"]
+)
 
 
-class LinkedType(typing.Generic[_T], JsonObjectWrapper):
+@export
+class LinkedType(typing.Generic[T], JsonObjectWrapper):
+    """Value linked to another value in the viewer state.
+
+    Type parameters:
+      T: Value type.
+    """
+
     __slots__ = ()
     link = wrapped_property("link", optional(navigation_link_type, "linked"))
-    value: _T
+    if _BUILDING_DOCS:
+        # For some reason `T` doesn't get resolved properly by sphinx-immaterial.
+        value: typing.Any
+    else:
+        value: T  # type: ignore[no-redef]
 
-    interpolate_function: typing.ClassVar[
+    _interpolate_function: typing.ClassVar[
         typing.Callable[[typing.Any, typing.Any, float], typing.Any]
     ]
 
@@ -1326,31 +1494,27 @@ class LinkedType(typing.Generic[_T], JsonObjectWrapper):
         c = copy.deepcopy(a)
         c.link = a.link
         if a.link == b.link and a.link != "linked":
-            c.value = cls.interpolate_function(a.value, b.value, t)
+            c.value = cls._interpolate_function(a.value, b.value, t)
             return c
         return c
 
 
 def make_linked_navigation_type(
-    value_type: typing.Callable[[typing.Any], _T], interpolate_function=None
-) -> type[LinkedType[_T]]:
+    value_type: typing.Callable[[typing.Any], T], interpolate_function=None
+) -> type[LinkedType[T]]:
     if interpolate_function is None:
-        _interpolate_function = value_type.interpolate  # type: ignore[attr-defined]
-    else:
-        _interpolate_function = interpolate_function
-
-    _value_type = value_type
+        interpolate_function = value_type.interpolate  # type: ignore[attr-defined]
 
     class Linked(LinkedType):
         __slots__ = ()
-        value_type = _value_type
-        interpolate_function = _interpolate_function
+        _value_type = value_type
+        _interpolate_function = interpolate_function
         value = wrapped_property("value", optional(value_type))
 
     return Linked
 
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
     _LinkedPositionBase = LinkedType[np.typing.NDArray[np.float32]]
 else:
     _LinkedPositionBase = make_linked_navigation_type(
@@ -1363,7 +1527,7 @@ class LinkedPosition(_LinkedPositionBase):
     __slots__ = ()
 
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
     _LinkedZoomFactorBase = LinkedType[float]
 else:
     _LinkedZoomFactorBase = make_linked_navigation_type(float, interpolate_zoom)
@@ -1374,7 +1538,7 @@ class LinkedZoomFactor(_LinkedZoomFactorBase):
     __slots__ = ()
 
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
     _LinkedDepthRangeBase = LinkedType[float]
 else:
     _LinkedDepthRangeBase = make_linked_navigation_type(float, interpolate_zoom)
@@ -1385,7 +1549,7 @@ class LinkedDepthRange(_LinkedDepthRangeBase):
     __slots__ = ()
 
 
-if typing.TYPE_CHECKING:
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
     _LinkedOrientationStateBase = LinkedType[np.typing.NDArray[np.float32]]
 else:
     _LinkedOrientationStateBase = make_linked_navigation_type(
@@ -1421,10 +1585,10 @@ class CrossSection(JsonObjectWrapper):
         return c
 
 
-if typing.TYPE_CHECKING:
-    _CrossSectionMapBase = TypedStringMap[CrossSection]
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
+    _CrossSectionMapBase = Map[str, CrossSection]
 else:
-    _CrossSectionMapBase = typed_string_map(CrossSection)
+    _CrossSectionMapBase = typed_map(str, CrossSection)
 
 
 @export
@@ -1441,7 +1605,7 @@ class CrossSectionMap(_CrossSectionMapBase):
 @export
 class DataPanelLayout(JsonObjectWrapper):
     __slots__ = ()
-    type = wrapped_property("type", text_type)
+    type = wrapped_property("type", str)
     cross_sections = crossSections = wrapped_property("crossSections", CrossSectionMap)
     orthographic_projection = orthographicProjection = wrapped_property(
         "orthographicProjection", optional(bool, False)
@@ -1481,7 +1645,7 @@ def data_panel_layout_wrapper(default_value="xy"):
 
 
 data_panel_layout_types = frozenset(
-    ["xy", "yz", "xz", "xy-3d", "yz-3d", "xz-3d", "4panel", "3d"]
+    ["xy", "yz", "xz", "xy-3d", "yz-3d", "xz-3d", "4panel", "4panel-alt", "3d"]
 )
 
 
@@ -1490,7 +1654,7 @@ def layout_specification(x, _readonly=False):
         x = "4panel"
     if isinstance(x, str):
         x = {"type": str(x)}
-    if isinstance(x, (StackLayout, LayerGroupViewer, DataPanelLayout)):
+    if isinstance(x, StackLayout | LayerGroupViewer | DataPanelLayout):
         return type(x)(x.to_json(), _readonly=_readonly)
     if not isinstance(x, dict):
         raise ValueError
@@ -1500,13 +1664,19 @@ def layout_specification(x, _readonly=False):
     return layout_type(x, _readonly=_readonly)
 
 
+_set_type_annotation(
+    layout_specification,
+    typing.Union["StackLayout", "LayerGroupViewer", "DataPanelLayout"],
+)
+
+
 layout_specification.supports_readonly = True  # type: ignore[attr-defined]
 
 
 @export
 class StackLayout(JsonObjectWrapper):
     __slots__ = ()
-    type = wrapped_property("type", text_type)
+    type = wrapped_property("type", str)
     flex = wrapped_property("flex", optional(float, 1))
     children = wrapped_property("children", typed_list(layout_specification))
 
@@ -1539,11 +1709,21 @@ class StackLayout(JsonObjectWrapper):
 
 @export
 def row_layout(children):
+    """Creates a row-oriented `StackLayout`.
+
+    Group:
+      viewer-state
+    """
     return StackLayout(type="row", children=children)
 
 
 @export
 def column_layout(children):
+    """Creates a column-oriented `StackLayout`.
+
+    Group:
+      viewer-state
+    """
     return StackLayout(type="column", children=children)
 
 
@@ -1556,13 +1736,13 @@ def interpolate_layout(a, b, t):
 @export
 class LayerGroupViewer(JsonObjectWrapper):
     __slots__ = ()
-    type = wrapped_property("type", text_type)
+    type = wrapped_property("type", str)
     flex = wrapped_property("flex", optional(float, 1))
-    layers = wrapped_property("layers", typed_list(text_type))
+    layers = wrapped_property("layers", typed_list(str))
     layout = wrapped_property("layout", data_panel_layout_wrapper("xy"))
     position = wrapped_property("position", LinkedPosition)
     velocity = wrapped_property(
-        "velocity", typed_map(key_type=text_type, value_type=DimensionPlaybackVelocity)
+        "velocity", typed_map(key_type=str, value_type=DimensionPlaybackVelocity)
     )
     cross_section_orientation = crossSectionOrientation = wrapped_property(
         "crossSectionOrientation", LinkedOrientationState
@@ -1583,7 +1763,7 @@ class LayerGroupViewer(JsonObjectWrapper):
         "projectionDepth", LinkedDepthRange
     )
     tool_bindings = toolBindings = wrapped_property(
-        "toolBindings", typed_map(key_type=text_type, value_type=tool)
+        "toolBindings", typed_map(key_type=str, value_type=Tool)
     )
 
     def __init__(self, *args, **kwargs):
@@ -1628,21 +1808,85 @@ add_data_panel_layout_types()
 
 
 @export
-class ViewerState(JsonObjectWrapper):
+class SegmentIdMapEntry(typing.NamedTuple):
+    key: int
+    value: int | None = None
+    label: str | None = None
+
+
+@export
+def layer_selected_value(x) -> None | int | numbers.Number | SegmentIdMapEntry:
+    """Normalizes the selected value for a layer."""
+    if isinstance(x, numbers.Number):
+        return x
+    if isinstance(x, str):
+        return int(x)
+    if isinstance(x, dict):
+        value = x.get("value")
+        if value is not None:
+            value = int(value)
+        return SegmentIdMapEntry(int(x["key"]), value, x.get("label"))
+    return None
+
+
+_set_type_annotation(layer_selected_value, None | numbers.Number | SegmentIdMapEntry)
+
+
+@export
+class LayerSelectionState(JsonObjectWrapper):
+    """Represents the selection state for a single layer."""
+
     __slots__ = ()
-    title = wrapped_property("title", optional(text_type))
+    supports_validation = True
+    local_position = wrapped_property(
+        "localPosition", optional(array_wrapper(np.float32))
+    )
+    value = wrapped_property("value", optional(layer_selected_value))
+    annotation_id = annotationId = wrapped_property("annotationId", optional(str))
+    annotation_part = annotationPart = wrapped_property("annotationPart", optional(int))
+    annotation_subsource = annotationSubsource = wrapped_property(
+        "annotationSubsource", optional(str)
+    )
+
+
+if typing.TYPE_CHECKING or _BUILDING_DOCS:
+    _LayerSelectedValuesBase = Map[str, LayerSelectionState]
+else:
+    _LayerSelectedValuesBase = typed_map(str, LayerSelectionState)
+
+
+@export
+class LayerSelectedValues(_LayerSelectedValuesBase):
+    """Specifies the data values associated with the current mouse position."""
+
+
+@export
+class DataSelectionState(SidePanelLocation):
+    position = wrapped_property("position", optional(array_wrapper(np.float32)))
+
+    layers = wrapped_property("layers", LayerSelectedValues)
+
+
+@export
+class ViewerState(JsonObjectWrapper):
+    """Complete Neuroglancer viewer state.
+
+    This includes all state that is normally encoded into a Neuroglancer URL."""
+
+    __slots__ = ()
+    title = wrapped_property("title", optional(str))
     dimensions = wrapped_property("dimensions", CoordinateSpace)
     relative_display_scales = relativeDisplayScales = wrapped_property(
-        "relativeDisplayScales", optional(typed_string_map(float))
+        "relativeDisplayScales", optional(typed_map(str, float))
     )
     display_dimensions = displayDimensions = wrapped_property(
-        "displayDimensions", optional(typed_list(text_type))
+        "displayDimensions", optional(typed_list(str))
     )
     position = voxel_coordinates = wrapped_property(
         "position", optional(array_wrapper(np.float32))
     )
     velocity = wrapped_property(
-        "velocity", typed_map(key_type=text_type, value_type=DimensionPlaybackVelocity)
+        "velocity", typed_map(key_type=str, value_type=DimensionPlaybackVelocity)
     )
     cross_section_orientation = crossSectionOrientation = wrapped_property(
         "crossSectionOrientation", optional(array_wrapper(np.float32, 4))
@@ -1665,6 +1909,9 @@ class ViewerState(JsonObjectWrapper):
         "projectionOrientation", optional(array_wrapper(np.float32, 4))
     )
     show_slices = showSlices = wrapped_property("showSlices", optional(bool, True))
+    hide_cross_section_background_3d = hideCrossSectionBackground3D = wrapped_property(
+        "hideCrossSectionBackground3D", optional(bool, False)
+    )
     show_axis_lines = showAxisLines = wrapped_property(
         "showAxisLines", optional(bool, True)
     )
@@ -1691,10 +1938,10 @@ class ViewerState(JsonObjectWrapper):
     layers = wrapped_property("layers", Layers)
     layout = wrapped_property("layout", layout_specification)
     cross_section_background_color = crossSectionBackgroundColor = wrapped_property(
-        "crossSectionBackgroundColor", optional(text_type)
+        "crossSectionBackgroundColor", optional(str)
     )
     projection_background_color = projectionBackgroundColor = wrapped_property(
-        "projectionBackgroundColor", optional(text_type)
+        "projectionBackgroundColor", optional(str)
     )
     selected_layer = selectedLayer = wrapped_property(
         "selectedLayer", SelectedLayerState
@@ -1711,8 +1958,12 @@ class ViewerState(JsonObjectWrapper):
         ),
     )
     tool_bindings = toolBindings = wrapped_property(
-        "toolBindings", typed_map(key_type=text_type, value_type=tool)
+        "toolBindings", typed_map(key_type=str, value_type=Tool)
     )
+    tool_palettes = toolPalettes = wrapped_property(
+        "toolPalettes", typed_map(key_type=str, value_type=ToolPalette)
+    )
+    selection = wrapped_property("selection", DataSelectionState)
 
     @staticmethod
     def interpolate(a, b, t):

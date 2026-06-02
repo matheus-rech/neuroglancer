@@ -24,10 +24,8 @@ import type {
   RenderedDataViewerState,
 } from "#src/rendered_data_panel.js";
 import {
-  clearOutOfBoundsPickData,
-  pickDiameter,
-  pickOffsetSequence,
-  pickRadius,
+  getPickDiameter,
+  getPickOffsetSequence,
   RenderedDataPanel,
 } from "#src/rendered_data_panel.js";
 import type { SliceView } from "#src/sliceview/frontend.js";
@@ -66,6 +64,7 @@ export interface SliceViewerState extends RenderedDataViewerState {
   wireFrame: TrackableBoolean;
   scaleBarOptions: TrackableScaleBarOptions;
   crossSectionBackgroundColor: TrackableRGB;
+  hideCrossSectionBackground3D: TrackableBoolean;
 }
 
 export enum OffscreenTextures {
@@ -100,12 +99,11 @@ const tempVec3b = vec3.create();
 const tempVec4 = vec4.create();
 
 export class SliceViewPanel extends RenderedDataPanel {
-  viewer: SliceViewerState;
+  declare viewer: SliceViewerState;
+  private sliceViewRenderHelper;
 
   private axesLineHelper = this.registerDisposer(AxesLineHelper.get(this.gl));
-  private sliceViewRenderHelper = this.registerDisposer(
-    SliceViewRenderHelper.get(this.gl, sliceViewPanelEmitColor),
-  );
+
   private colorFactor = vec4.fromValues(1, 1, 1, 1);
   private pickIDs = new PickIDManager();
 
@@ -167,6 +165,16 @@ export class SliceViewPanel extends RenderedDataPanel {
     viewer: SliceViewerState,
   ) {
     super(context, element, viewer);
+
+    this.sliceViewRenderHelper = this.registerDisposer(
+      SliceViewRenderHelper.get(
+        this.gl,
+        sliceViewPanelEmitColor,
+        this.viewer,
+        false /*sliceViewPanel*/,
+      ),
+    );
+
     viewer.wireFrame.changed.add(() => this.scheduleRedraw());
     registerActionListener(
       element,
@@ -435,12 +443,13 @@ export class SliceViewPanel extends RenderedDataPanel {
   }
 
   ensureBoundsUpdated() {
-    super.ensureBoundsUpdated();
+    super.ensureBoundsUpdated(true /* canScaleForScreenshot */);
     this.sliceView.projectionParameters.setViewport(this.renderViewport);
   }
 
-  issuePickRequest(glWindowX: number, glWindowY: number) {
+  issuePickRequest(glWindowX: number, glWindowY: number, pickRadius: number) {
     const { offscreenFramebuffer } = this;
+    const pickDiameter = getPickDiameter(pickRadius);
     offscreenFramebuffer.readPixelFloat32IntoBuffer(
       OffscreenTextures.PICK,
       glWindowX - pickRadius,
@@ -456,18 +465,12 @@ export class SliceViewPanel extends RenderedDataPanel {
     glWindowY: number,
     data: Float32Array,
     pickingData: FramePickingData,
+    pickRadius: number,
   ) {
     const { mouseState } = this.viewer;
     mouseState.pickedRenderLayer = null;
-    clearOutOfBoundsPickData(
-      data,
-      0,
-      4,
-      glWindowX,
-      glWindowY,
-      pickingData.viewportWidth,
-      pickingData.viewportHeight,
-    );
+    const pickDiameter = getPickDiameter(pickRadius);
+    const pickOffsetSequence = getPickOffsetSequence(pickRadius);
     const { viewportWidth, viewportHeight } = pickingData;
     const numOffsets = pickOffsetSequence.length;
     const { value: voxelCoordinates } = this.navigationState.position;
