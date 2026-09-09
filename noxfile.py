@@ -186,6 +186,8 @@ def cibuildwheel(session: nox.Session):
             "CIBW_SKIP": "*_i686 *-win32 *-musllinux* cp314*",
             "CIBW_TEST_GROUPS": "test",
             "CIBW_TEST_COMMAND": "python -m pytest {project}/python/tests -vv -s --skip-browser-tests",
+            # cryptography, which google-apitools pulls in through oauth2client and pyOpenSSL, stopped publishing macOS x86_64 wheels at 50.0, so a test environment for that platform can no longer be created on the arm64 runner. The wheel itself still builds and is uploaded.
+            "CIBW_TEST_SKIP": "*-macosx_x86_64",
             "CIBW_MANYLINUX_X86_64_IMAGE": "manylinux_2_28",
             # Assume the client bundle was already built. The github actions workflow builds
             # the client with specific defines to include the build stamp, and that would be

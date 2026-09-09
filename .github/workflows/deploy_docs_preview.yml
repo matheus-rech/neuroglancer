@@ -14,8 +14,12 @@ jobs:
     permissions:
       statuses: write
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    env:
+      # A fork has no key for the neuroglancer-demo Firebase project, and without this guard the job opens a pending commit status it can never close, leaving every pull request waiting on a preview that cannot be built.
+      FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY: ${{ secrets.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY }}
     steps:
       - name: "Create commit status"
+        if: env.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY != ''
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -47,6 +51,7 @@ jobs:
           GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
       - uses: FirebaseExtended/action-hosting-deploy@e2eda2e106cfa35cdbcf4ac9ddaf6c4756df2c8c # v0.10.0
         id: deploy
+        if: env.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY != ''
         with:
           repoToken: "${{ secrets.GITHUB_TOKEN }}"
           firebaseServiceAccount: "${{ secrets.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY }}"
@@ -55,6 +60,7 @@ jobs:
           projectId: neuroglancer-demo
           target: docs
       - name: "Update commit status"
+        if: env.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY != ''
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
